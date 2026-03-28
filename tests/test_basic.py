@@ -47,6 +47,7 @@ from rombob import (
     CollectionCodec,
     Context,
     EnumCodec,
+    Factory,
     IntCodec,
     IVInt,
     LiteralCodec,
@@ -690,3 +691,107 @@ def test_class_codec():
         data.integer = 256
         data.somemorebytes = b"\x00"
         Context().write(codec, data)
+
+
+class TestFactory:
+    def test_register(self):
+        factory = Factory("id")
+
+        with pytest.raises(
+            BytesOperationError,
+            match=r"must be a class",
+        ):
+            factory.register(str)
+
+        with pytest.raises(
+            BytesOperationError,
+            match=r"have no codec for field",
+        ):
+
+            @factory.register
+            @dataclasses.dataclass
+            class Packet:
+                id_: t.Literal[1, 2, 3]
+
+        with pytest.raises(
+            BytesOperationError,
+            match=r"should be typing.Literal",
+        ):
+
+            @factory.register
+            @dataclasses.dataclass
+            class Packet:
+                id: list[str]
+
+        @factory.register
+        @dataclasses.dataclass
+        class Packet:
+            id: t.Literal[1, 2, 3]
+
+        assert factory.id_map[1] == Packet
+        assert factory.id_map[2] == Packet
+        assert factory.id_map[3] == Packet
+        assert 1 in factory.codecs
+        assert 2 in factory.codecs
+        assert 3 in factory.codecs
+        assert len(factory.id_map) == 3
+        assert len(factory.codecs) == 3
+
+    def test_register_subclasses(self):
+        @dataclasses.dataclass
+        class Packet:
+            id: t.Literal[100]
+
+        @dataclasses.dataclass
+        class PacketA(Packet):
+            id: t.Literal[1]
+
+        @dataclasses.dataclass
+        class PacketB(Packet):
+            id: t.Literal[2]
+
+        @dataclasses.dataclass
+        class PacketAA(PacketA):
+            id: t.Literal[3]
+
+        factory = Factory("id")
+        factory.register_subclasses(Packet)
+
+        assert factory.id_map.get(100) is None
+        assert factory.id_map[1] == PacketA
+        assert factory.id_map[2] == PacketB
+        assert factory.id_map.get(3) is None
+
+        factory = Factory("id")
+        factory.register_subclasses(Packet, include_base=True)
+
+        assert factory.id_map.get(100) == Packet
+        assert factory.id_map[1] == PacketA
+        assert factory.id_map[2] == PacketB
+        assert factory.id_map.get(3) is None
+
+    def test_encode_decode(self):
+        factory = Factory("id")
+
+        @factory.register
+        @dataclasses.dataclass
+        class Packet:
+            id: t.Annotated[t.Literal[1, 2, 3], StructCodec(">B")]
+
+        @dataclasses.dataclass
+        class SimilarPacket:
+            id: t.Annotated[t.Literal[1, 2, 3], StructCodec(">B")]
+
+        @dataclasses.dataclass
+        class WrongPacket:
+            id: t.Annotated[t.Literal[4, 5, 6], StructCodec(">B")]
+
+        assert factory.encode(Packet(id=1)) == b"\x01"
+        assert factory.encode(SimilarPacket(id=2)) == b"\x02"
+        assert factory.encode(WrongPacket(id=4)) is None
+
+        assert factory.decode(b"\x01") == Packet(id=1)
+        assert factory.decode(b"\x02") == Packet(id=2)
+        assert factory.decode(b"\x04") is None
+        with pytest.raises(BytesOperationError):
+            factory.decode(b"")

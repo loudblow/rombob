@@ -32,6 +32,7 @@ __all__ = [
     "OptionalCodec",
     "ValidatorCodec",
     "EnumCodec",
+    "Factory",
     "LiteralCodec",
     "NamedCodec",
     "ClassCodec",
@@ -673,3 +674,65 @@ def decode(
     codec = codec or get_codec(cls)
     with Context(memoryview(data)) as ctx:
         return ctx.read(codec)
+
+
+@dataclasses.dataclass(slots=True)
+class Factory:
+    primary_field: str
+    id_map: dict[int, type] = dataclasses.field(default_factory=dict)
+    codecs: dict[int, t.Callable] = dataclasses.field(default_factory=dict)
+
+    def register(self, cls: type[T]) -> type[T]:
+        codec = get_codec(cls)
+        if not isinstance(codec, ClassCodec):
+            raise BytesOperationError(f"{cls} must be a class")
+
+        fields = dict(codec.fields)
+        primary_codec: Codec | None = fields.get(self.primary_field)
+        if primary_codec is None:
+            raise BytesOperationError(
+                f"{cls} have no codec for field {self.primary_field}"
+            )
+
+        if not isinstance(primary_codec, LiteralCodec):
+            raise BytesOperationError(
+                f"{cls}.{self.primary_field} (cls={type(primary_codec)}) "
+                f"should be typing.Literal"
+            )
+
+        for id in primary_codec.literals:
+            self.id_map[id] = cls
+            self.codecs[id] = codec
+        return cls
+
+    def register_subclasses(
+        self, cls: type[T], *, include_base: bool = False
+    ) -> type[T]:
+        """
+        Register subclasses of the `cls`. Note that it's not a recursive
+        method, only direct subclasses will be registered.
+
+        :param cls: the base class
+        :param include_base: True if you also need to register the base class
+        :return: the base class
+        """
+        if include_base:
+            self.register(cls)
+        for subclass in cls.__subclasses__():
+            self.register(subclass)
+        return cls
+
+    def encode(self, value: t.Any) -> t.SupportsBytes | None:
+        with Context() as ctx:
+            codec = self.codecs.get(value.id)
+            if codec is None:
+                return None
+            ctx.write(codec=codec, value=value)
+        return ctx.buffer
+
+    def decode(self, buffer: t.SupportsBytes) -> t.Any | None:
+        with Context(memoryview(buffer)) as ctx:
+            codec = self.codecs.get(buffer[0])
+            if codec is None:
+                return None
+            return ctx.read(codec=self.codecs[buffer[0]])
