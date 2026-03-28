@@ -1,6 +1,6 @@
 [project]
 name = "rombob"
-version = "0.9.0"
+version = "0.9.1"
 description = "A simple library for building complex byte structures."
 authors = [
     {name = "loudblow", email = "145815114+loudblow@users.noreply.github.com"}
