@@ -2,14 +2,8 @@ import dataclasses
 import enum
 import functools
 import struct as s
-import sys
 import types
 import typing as t
-
-if sys.version_info >= (3, 12):
-    from collections.abc import Buffer
-else:
-    from collections.abc import ByteString as Buffer
 
 from annotated_types import Len
 
@@ -80,6 +74,7 @@ __all__ = [
 T = t.TypeVar("T")
 B = t.TypeVar("B")
 EnumT = t.TypeVar("EnumT", bound=enum.Enum)
+Buffer = t.Union[bytes, bytearray, memoryview]  # noqa: UP007
 
 _NAMED_MARKER = "__rombob__NamedMarker__"
 Named = t.Annotated[T, _NAMED_MARKER]
@@ -269,7 +264,7 @@ class BytesCodec(Codec[bytes]):
 
     def read(self, ctx: Context) -> bytes:
         length = self.length or self.len_codec.read(ctx)
-        return ctx.pop(length).tobytes()
+        return bytes(ctx.pop(length))
 
 
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
@@ -315,7 +310,7 @@ class RawCodec(Codec[bytes]):
         ctx.buffer += value
 
     def read(self, ctx: Context) -> bytes:
-        rv = ctx.buffer.tobytes()
+        rv = bytes(ctx.buffer)
         ctx.buffer = ctx.buffer[:0]
         return rv
 
@@ -371,12 +366,17 @@ class ValidatorCodec(Codec[T]):
         self.codec.write(value, ctx)
 
 
-def EnumCodec(codec: Codec, cls: EnumT) -> Codec[EnumT]:
-    return ValidatorCodec(
-        codec=codec,
-        read_validator=lambda d: cls(d),
-        write_validator=lambda d: d.value,
-    )
+@cache
+@dataclasses.dataclass(slots=True, frozen=True)
+class EnumCodec(Codec[EnumT]):
+    codec: Codec
+    cls: EnumT
+
+    def read(self, ctx: Context) -> EnumT:
+        return self.cls(self.codec.read(ctx))
+
+    def write(self, value: EnumT, ctx: Context) -> None:
+        return self.codec.write(value.value, ctx)
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -653,10 +653,13 @@ def encode(
     value: T,
     codec: Codec[T] | None = None,
     cls: type[T] | None = None,
-) -> bytearray:
+    ctx: Context | None = None,
+) -> Buffer:
     if not codec:
         codec = get_codec(cls or type(value))
-    with Context() as ctx:
+    if ctx is None:
+        ctx = Context()
+    with ctx:
         ctx.write(codec=codec, value=value)
     return ctx.buffer
 
@@ -665,14 +668,17 @@ def decode(
     data: Buffer,
     codec: Codec[T] | None = None,
     cls: type[T] | None = None,
+    ctx: Context | None = None,
 ) -> T:
     if not (codec or cls):
         raise ValueError(
             "Both codec and cls is None. "
             "At least one of them should be provided!"
         )
+    if ctx is None:
+        ctx = Context(memoryview(data))
     codec = codec or get_codec(cls)
-    with Context(memoryview(data)) as ctx:
+    with ctx:
         return ctx.read(codec)
 
 
@@ -722,17 +728,23 @@ class Factory:
             self.register(subclass)
         return cls
 
-    def encode(self, value: t.Any) -> t.SupportsBytes | None:
-        with Context() as ctx:
-            codec = self.codecs.get(value.id)
+    def encode(self, value: t.Any, ctx: Context | None = None) -> Buffer | None:
+        if ctx is None:
+            ctx = Context()
+        with ctx:
+            codec: Codec | None = self.codecs.get(value.id)
             if codec is None:
                 return None
-            ctx.write(codec=codec, value=value)
+            codec.write(value=value, ctx=ctx)
         return ctx.buffer
 
-    def decode(self, buffer: t.SupportsBytes) -> t.Any | None:
-        with Context(memoryview(buffer)) as ctx:
-            codec = self.codecs.get(buffer[0])
+    def decode(self, buffer_or_ctx: Buffer | Context) -> t.Any | None:
+        if isinstance(buffer_or_ctx, Context):
+            ctx = buffer_or_ctx
+        else:
+            ctx = Context(memoryview(buffer_or_ctx))
+        with ctx:
+            codec: Codec | None = self.codecs.get(ctx.buffer[0])
             if codec is None:
                 return None
-            return ctx.read(codec=self.codecs[buffer[0]])
+            return codec.read(ctx=ctx)
