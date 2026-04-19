@@ -795,3 +795,12 @@ class TestFactory:
         assert factory.decode(b"\x04") is None
         with pytest.raises(BytesOperationError):
             factory.decode(b"")
+
+        ctx = Context(buffer=bytearray(b"prefix"))
+        result = factory.encode(Packet(id=1), ctx=ctx)
+        assert result == b"prefix\x01"
+        assert bytes(ctx.buffer) == b"prefix\x01"
+
+        ctx = Context(memoryview(b"\x01"))
+        result = factory.decode(ctx)
+        assert result == Packet(id=1)
