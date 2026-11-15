@@ -12,7 +12,7 @@ make lint       # pre-commit run
 
 ## Single Test
 ```bash
-poetry run pytest tests/test_basic.py -v -k test_name
+poetry run pytest tests/test_codecs.py -v -k test_name
 ```
 
 ## Key Commands
@@ -20,12 +20,27 @@ poetry run pytest tests/test_basic.py -v -k test_name
 - `make clean` - clean caches and temp files
 
 ## Architecture
-- **Package**: `src/rombob/` (single package, entry via `__init__.py`)
-- **Tests**: `tests/test_basic.py`
-- **API**: `rombob.encode(value)` / `rombob.decode(data, cls)`
+- **Package**: `src/rombob/`; `__init__.py` only re-exports the public API. Modules, lowest layer first (imports go strictly downward):
+  - `errors.py` (`BytesOperationError`), `typing.py` (type vars, `ByteOrder`/`LE`/`BE`, `ParserContext`, `Args`), `metadata.py` (annotations: `Len`, `Gt`, `When`, ...)
+  - `buffers.py` (`Reader`, `Writer`)
+  - `codecs.py` (`Codec` and all primitive/composite codecs)
+  - `aliases.py` (`U8_B`, `I24_L`, `IVInt`, `Raw`, ... as `Annotated` aliases)
+  - `compiler.py` (specs, segments, code generation, `ClassCodec`)
+  - `parser.py` (hint -> codec, `get_codec`, caches)
+  - `tracing.py` (`trace_errors=True` support)
+  - `factory.py` (`Factory`, `encode`, `decode`)
+  - `codecs.py` reaches `tracing` (failure path) and `compiler._leaf_item` through lazy imports; keep it that way to avoid cycles.
+- **Tests** mirror the modules: `test_codecs.py`, `test_aliases.py`, `test_buffers.py`, `test_compiler.py`, `test_parser.py` (+ `test_forward_refs.py`), `test_metadata.py`, `test_tracing.py`, `test_factory.py`, `test_tuples.py`. Shared model classes live in `tests/models.py`.
+- **API**: `rombob.encode(value)` / `rombob.decode(data, cls)` (simple, via `get_codec`). Fast paths: `Codec.encode/encode_to/decode/decode_from` (explicit codec) and `Factory.encode/encode_to/decode/decode_from` (dispatch by primary field, no optional params). Errors are wrapped only in these entry points; `Codec.read/write` never wrap.
 
 ## Codec Caching
-All `Codec` classes are cached via `@cache` (from `functools.lru_cache`). This means codec instances are memoized - the same codec is returned for identical type hints. Tests involving codec state should account for this.
+Codec classes are plain classes with value-based `__eq__`/`__hash__` (frozen dataclasses, `StructCodec` compares by format). Constructors do not intern instances. Memoization lives in `get_codec(hint)`, which caches per hint (unhashable hints are built without caching). Codecs must be stateless: all per-call state lives in `Reader`/`Writer`, so one codec can be shared freely. `get_codec(hint, compile=False)` returns the plain, non-compiled codecs (used by tests to compare against the compiled path).
+
+## Compiler
+`ClassCodec` for dataclasses/NamedTuples groups consecutive fixed-size fields (struct types, 24/48-bit ints, fixed `str`/`bytes`/collections, literals, enums, validators, nested all-fixed classes) into struct segments and generates `read`/`write` source (`codec.source`). See `repr(get_codec(cls))` for the segment layout.
+
+## Benchmarks
+`benchmarks/bench.py` (end-to-end encode/decode) and `benchmarks/bench_int24.py`.
 
 ## Language Policy
 - Reply to the user in the language the user is communicating in.
