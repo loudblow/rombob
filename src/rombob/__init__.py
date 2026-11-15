@@ -208,15 +208,67 @@ LE = ByteOrder.LITTLE
 BE = ByteOrder.BIG
 
 
-@t.runtime_checkable
-class Codec(t.Protocol[T]):
+class Codec(t.Generic[T]):
     """
+    Base class of all codecs. Subclasses implement `write`/`read`, which are
+    used internally (and recursively) and never wrap errors. `encode`,
+    `encode_to`, `decode` and `decode_from` are the entry points: they are
+    where errors are wrapped into `BytesOperationError`.
+
     Codecs must be stateless: all per-call state lives in Reader/Writer,
     so one codec can be shared by any number of calls.
     """
 
-    def write(self, value: T, w: Writer) -> None: ...
-    def read(self, r: Reader) -> T: ...
+    __slots__ = ()
+
+    def write(self, value: T, w: Writer) -> None:
+        raise NotImplementedError
+
+    def read(self, r: Reader) -> T:
+        raise NotImplementedError
+
+    def encode(self, value: T) -> bytes:
+        """Encode the value into new bytes."""
+        w = Writer()
+        try:
+            self.write(value, w)
+        except Exception as exc:
+            raise BytesOperationError(
+                f"Encoding failed at length {len(w.buffer)}: {exc}"
+            ) from exc
+        return bytes(w.buffer)
+
+    def encode_to(self, value: T, w: Writer) -> None:
+        """Append the encoded value to `w`. On failure `w` is left intact."""
+        start = len(w.buffer)
+        try:
+            self.write(value, w)
+        except Exception as exc:
+            del w.buffer[start:]
+            raise BytesOperationError(
+                f"Encoding failed at length {len(w.buffer)}: {exc}"
+            ) from exc
+
+    def decode(self, data: Buffer) -> T:
+        """Decode a value from the start of `data`."""
+        r = Reader(data)
+        try:
+            return self.read(r)
+        except Exception as exc:
+            raise BytesOperationError(
+                f"Decoding failed at offset {r.offset}: {exc}"
+            ) from exc
+        finally:
+            r.release()
+
+    def decode_from(self, r: Reader) -> T:
+        """Decode a value at the reader's offset and advance it."""
+        try:
+            return self.read(r)
+        except Exception as exc:
+            raise BytesOperationError(
+                f"Decoding failed at offset {r.offset}: {exc}"
+            ) from exc
 
 
 @functools.cache
@@ -1725,66 +1777,6 @@ def _get_codec_inner(
 
 
 # ---------------------------------------------------------------------------
-# Entry points: the only place where errors are wrapped
-# ---------------------------------------------------------------------------
-
-
-def encode(
-    value: T,
-    codec: Codec[T] | None = None,
-    cls: type[T] | None = None,
-    writer: Writer | None = None,
-) -> bytes:
-    """
-    Encode the value. Returns the whole content of the writer's buffer
-    (just the encoded value unless a `writer` with data is given).
-    On failure nothing is left in the user-supplied writer.
-    """
-    w = Writer() if writer is None else writer
-    start = len(w.buffer)
-    try:
-        if codec is None:
-            codec = get_codec(cls or type(value))
-        codec.write(value, w)
-    except Exception as exc:
-        del w.buffer[start:]
-        raise BytesOperationError(
-            f"Encoding failed at length {len(w.buffer)}: {exc}"
-        ) from exc
-    return bytes(w.buffer)
-
-
-def decode(
-    data: Buffer,
-    codec: Codec[T] | None = None,
-    cls: type[T] | None = None,
-    reader: Reader | None = None,
-) -> T:
-    """
-    Decode a value from `data`, or from the `reader` if it is provided
-    (the reader's offset is advanced).
-    """
-    if not (codec or cls):
-        raise ValueError(
-            "Both codec and cls is None. "
-            "At least one of them should be provided!"
-        )
-    own = reader is None
-    r = Reader(data) if reader is None else reader
-    try:
-        if codec is None:
-            codec = get_codec(cls)
-        return codec.read(r)
-    except Exception as exc:
-        raise BytesOperationError(
-            f"Decoding failed at offset {r.offset}: {exc}"
-        ) from exc
-    finally:
-        if own:
-            r.release()
-
-
-# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1869,13 +1861,28 @@ class Factory:
             self.register(subclass)
         return cls
 
-    def encode(
-        self, value: t.Any, writer: Writer | None = None
-    ) -> bytes | None:
+    def encode(self, value: t.Any) -> bytes | None:
+        """Encode the value, `None` if its primary id is not registered."""
         codec = self.codecs.get(getattr(value, self.primary_field))
         if codec is None:
             return None
-        w = Writer() if writer is None else writer
+        w = Writer()
+        try:
+            codec.write(value, w)
+        except Exception as exc:
+            raise BytesOperationError(
+                f"Encoding failed at length {len(w.buffer)}: {exc}"
+            ) from exc
+        return bytes(w.buffer)
+
+    def encode_to(self, value: t.Any, w: Writer) -> bool:
+        """
+        Append the encoded value to `w`. Returns False (and writes nothing)
+        if its primary id is not registered. On failure `w` is left intact.
+        """
+        codec = self.codecs.get(getattr(value, self.primary_field))
+        if codec is None:
+            return False
         start = len(w.buffer)
         try:
             codec.write(value, w)
@@ -1884,16 +1891,15 @@ class Factory:
             raise BytesOperationError(
                 f"Encoding failed at length {len(w.buffer)}: {exc}"
             ) from exc
-        return bytes(w.buffer)
+        return True
 
-    def decode(self, data_or_reader: Buffer | Reader) -> t.Any | None:
-        own = not isinstance(data_or_reader, Reader)
-        r = Reader(data_or_reader) if own else data_or_reader
+    def decode(self, data: Buffer) -> t.Any | None:
+        """Decode the value in `data`, `None` if its id is not registered."""
+        r = Reader(data)
         try:
             if self._size is None:
                 return None
-            key = bytes(r.peek(self._size, self._offset))
-            codec = self._dispatch.get(key)
+            codec = self._dispatch.get(bytes(r.peek(self._size, self._offset)))
             if codec is None:
                 return None
             return codec.read(r)
@@ -1902,5 +1908,73 @@ class Factory:
                 f"Decoding failed at offset {r.offset}: {exc}"
             ) from exc
         finally:
-            if own:
-                r.release()
+            r.release()
+
+    def decode_from(self, r: Reader) -> t.Any | None:
+        """
+        Decode the value at the reader's offset and advance it. Returns
+        None (offset untouched) if its id is not registered.
+        """
+        try:
+            if self._size is None:
+                return None
+            codec = self._dispatch.get(bytes(r.peek(self._size, self._offset)))
+            if codec is None:
+                return None
+            return codec.read(r)
+        except Exception as exc:
+            raise BytesOperationError(
+                f"Decoding failed at offset {r.offset}: {exc}"
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Module-level API: simple, not the fastest path (see Codec / Factory)
+# ---------------------------------------------------------------------------
+
+
+def encode(
+    value: T,
+    codec: Codec[T] | None = None,
+    cls: type[T] | None = None,
+    writer: Writer | None = None,
+) -> bytes:
+    """
+    Encode the value. Returns the whole content of the writer's buffer
+    (just the encoded value unless a `writer` with data is given).
+    On failure nothing is left in the user-supplied writer.
+    """
+    if codec is None:
+        try:
+            codec = get_codec(cls or type(value))
+        except Exception as exc:
+            raise BytesOperationError(f"Encoding failed: {exc}") from exc
+    if writer is None:
+        return codec.encode(value)
+    codec.encode_to(value, writer)
+    return bytes(writer.buffer)
+
+
+def decode(
+    data: Buffer,
+    codec: Codec[T] | None = None,
+    cls: type[T] | None = None,
+    reader: Reader | None = None,
+) -> T:
+    """
+    Decode a value from `data`, or from the `reader` if it is provided
+    (the reader's offset is advanced).
+    """
+    if not (codec or cls):
+        raise ValueError(
+            "Both codec and cls is None. "
+            "At least one of them should be provided!"
+        )
+    if codec is None:
+        try:
+            codec = get_codec(cls)
+        except Exception as exc:
+            raise BytesOperationError(f"Decoding failed: {exc}") from exc
+    if reader is None:
+        return codec.decode(data)
+    return codec.decode_from(reader)

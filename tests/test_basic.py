@@ -799,10 +799,15 @@ class TestFactory:
             factory.decode(b"")
 
         w = Writer(bytearray(b"prefix"))
-        result = factory.encode(Packet(id=1), writer=w)
-        assert result == b"prefix\x01"
+        assert factory.encode_to(Packet(id=1), w) is True
+        assert bytes(w.buffer) == b"prefix\x01"
+        assert factory.encode_to(WrongPacket(id=4), w) is False
         assert bytes(w.buffer) == b"prefix\x01"
 
-        r = Reader(b"\x01")
-        result = factory.decode(r)
-        assert result == Packet(id=1)
+        r = Reader(b"\x01\x04")
+        assert factory.decode_from(r) == Packet(id=1)
+        assert r.offset == 1
+        assert factory.decode_from(r) is None
+        assert r.offset == 1
+        with pytest.raises(BytesOperationError):
+            factory.decode_from(Reader(b""))

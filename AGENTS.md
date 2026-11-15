@@ -22,7 +22,7 @@ poetry run pytest tests/test_basic.py -v -k test_name
 ## Architecture
 - **Package**: `src/rombob/` (single package, entry via `__init__.py`)
 - **Tests**: `tests/test_basic.py`, `tests/test_compiler.py`
-- **API**: `rombob.encode(value)` / `rombob.decode(data, cls)`
+- **API**: `rombob.encode(value)` / `rombob.decode(data, cls)` (simple, via `get_codec`). Fast paths: `Codec.encode/encode_to/decode/decode_from` (explicit codec) and `Factory.encode/encode_to/decode/decode_from` (dispatch by primary field, no optional params). Errors are wrapped only in these entry points; `Codec.read/write` never wrap.
 
 ## Codec Caching
 Codec classes are plain classes with value-based `__eq__`/`__hash__` (frozen dataclasses, `StructCodec` compares by format). Constructors do not intern instances. Memoization lives in `get_codec(hint)`, which caches per hint (unhashable hints are built without caching). Codecs must be stateless: all per-call state lives in `Reader`/`Writer`, so one codec can be shared freely. `get_codec(hint, compile=False)` returns the plain, non-compiled codecs (used by tests to compare against the compiled path).
