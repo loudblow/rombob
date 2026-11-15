@@ -69,6 +69,8 @@ from .metadata import Range as Range
 from .metadata import Skip as Skip
 from .metadata import When as When
 from .parser import get_codec as get_codec
+from .parser import register_codec as register_codec
+from .parser import unregister_codec as unregister_codec
 from .typing import BE as BE
 from .typing import LE as LE
 from .typing import Args as Args
@@ -148,6 +150,8 @@ __all__ = [
     "ParserContext",
     "Args",
     "get_codec",
+    "register_codec",
+    "unregister_codec",
     "encode",
     "decode",
 ]

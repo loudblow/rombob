@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import typing as t
 
 import pytest
@@ -6,6 +7,7 @@ import pytest
 from rombob import (
     U8_B,
     BytesOperationError,
+    EnumCodec,
     Factory,
     Reader,
     StructCodec,
@@ -130,6 +132,43 @@ class TestFactory:
         assert r.offset == 1
         with pytest.raises(BytesOperationError):
             factory.decode_from(Reader(b""))
+
+    def test_enum_literal_id(self):
+        class MessageID(enum.IntEnum):
+            PING = 1
+            PONG = 2
+
+        ping = t.Annotated[
+            t.Literal[MessageID.PING],
+            EnumCodec(codec=StructCodec(">B"), cls=MessageID),
+        ]
+        pong = t.Annotated[
+            t.Literal[MessageID.PONG],
+            EnumCodec(codec=StructCodec(">H"), cls=MessageID),
+        ]
+
+        factory = Factory("id")
+
+        @factory.register
+        @dataclasses.dataclass
+        class Ping:
+            id: ping
+            x: U8_B = 0
+
+        assert factory.id_map == {MessageID.PING: Ping}
+        assert factory.encode(Ping(id=MessageID.PING, x=7)) == b"\x01\x07"
+        decoded = factory.decode(b"\x01\x07")
+        assert decoded == Ping(id=MessageID.PING, x=7)
+        assert type(decoded.id) is MessageID
+        assert factory.decode(b"\x02\x07") is None
+
+        # a different size of the primary field is still rejected
+        @dataclasses.dataclass
+        class Pong:
+            id: pong
+
+        with pytest.raises(BytesOperationError, match=r"registered classes"):
+            factory.register(Pong)
 
 
 # - - - - - factory with wide ids - - - - - #

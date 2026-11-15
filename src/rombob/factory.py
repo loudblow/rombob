@@ -45,15 +45,15 @@ class Factory:
         inner = _to_spec(primary_codec.codec)
         if offset is None or inner is None:
             raise BytesOperationError(
-                f"{cls}.{self.primary_field} should be a fixed-size integer "
+                f"{cls}.{self.primary_field} should be a fixed-size literal "
                 f"at a static offset"
             )
         try:
             packed = {v: inner.packed(v) for v in primary_codec.literals}
         except Exception as exc:
             raise BytesOperationError(
-                f"{cls}.{self.primary_field} should be a fixed-size integer "
-                f"literal"
+                f"{cls}.{self.primary_field} should be a literal of integers, "
+                f"strings or bytes of a fixed size"
             ) from exc
         if self._size is not None and (self._offset, self._size) != (
             offset,
@@ -198,7 +198,7 @@ def decode(
     Decode a value from `data`, or from the `reader` if it is provided
     (the reader's offset is advanced). `trace_errors`: see `Codec.encode`.
     """
-    if not (codec or cls):
+    if codec is None and cls is None:
         raise ValueError(
             "Both codec and cls is None. "
             "At least one of them should be provided!"

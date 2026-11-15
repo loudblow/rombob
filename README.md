@@ -179,6 +179,11 @@ Every alias comes in two flavors: `_B` (big-endian) and `_L` (little-endian).
 
 - **Fast paths** — `Codec.encode/decode` with an explicit codec, or `Factory` for
   dispatch by primary field. See `rombob.get_codec(cls)` to build and inspect a codec.
+- **Custom types** — `rombob.register_codec(SystemAddress, SystemAddressCodec())`
+  makes the codec the default for that type everywhere (fields, collections,
+  `get_codec`); an explicit `Annotated[..., codec]` still wins. Pass
+  `override=True` to replace an existing one, `unregister_codec` removes it.
+  Register before building codecs and registering classes in a `Factory`.
 - **Streaming** — pass `reader=` / `writer=` to `decode` / `encode` to continue an
   existing buffer.
 - **Benchmarks** — see [`benchmarks/`](benchmarks) (`bench.py`, `bench_int24.py`).

@@ -27,6 +27,17 @@ from .errors import BytesOperationError
 from .metadata import CONSTRAINTS, NAMED, SKIP, Len, Prefix, When
 from .typing import Args, ParserContext, T
 
+_COMPILE = True  # see get_codec(compile=...)
+
+_CODECS: dict[t.Any, Codec] = {}
+_PLAIN_CODECS: dict[t.Any, Codec] = {}
+# Two maps on purpose. `_FALLBACKS` are the defaults for plain leftovers and
+# are consulted last: `str`/`bytes`/collections are built by their own
+# branches first because they need `Len`/`Prefix`. `_REGISTERED` (see
+# `register_codec`) are user overrides and win over every branch, so they
+# can't live in `_FALLBACKS` without stopping `str`/`bytes` from honouring
+# `Len`. Both are consulted where a base codec is looked up.
+_REGISTERED: dict[t.Any, Codec] = {}
 _FALLBACKS: dict[type, Codec] = {
     bool: StructCodec("?"),
     str: StringCodec(len_codec=StructCodec(">H")),
@@ -34,11 +45,6 @@ _FALLBACKS: dict[type, Codec] = {
     int: StructCodec(">q"),
     float: StructCodec(">d"),
 }
-
-_COMPILE = True  # see get_codec(compile=...)
-
-_CODECS: dict[t.Any, Codec] = {}
-_PLAIN_CODECS: dict[t.Any, Codec] = {}
 
 
 def get_codec(hint: type[T], *, compile: bool = True) -> Codec[T]:
@@ -59,6 +65,75 @@ def get_codec(hint: type[T], *, compile: bool = True) -> Codec[T]:
     return codec
 
 
+def register_codec(
+    hint: t.Any, codec: Codec, *, override: bool = False
+) -> Codec:
+    """
+    Register `codec` as the default codec of `hint` (usually a class).
+
+    From now on every field and every `get_codec` call of that type uses it,
+    unless the field carries an explicit codec in `Annotated`. Registered
+    codecs take priority over the built-in handling of dataclasses, enums and
+    primitives. Subscripted generics (`Foo[int]`) fall back to the codec of
+    their origin (`Foo`) when they have no codec of their own.
+
+    Classes and codecs built before the call are not affected (the memoized
+    ones are dropped, but the objects you already hold stay as they are), so
+    register before building codecs and registering classes in a `Factory`.
+
+    :param override: allow replacing an already registered (or a built-in
+        primitive) codec of the same hint
+    :return: the codec, so it can be used inline
+    """
+    if not isinstance(codec, Codec):
+        raise BytesOperationError(
+            f"register_codec expects a Codec, got {codec!r}"
+        )
+    if t.get_origin(hint) is t.Annotated:
+        raise BytesOperationError(
+            f"Can't register a codec for {hint}: Annotated hints carry "
+            f"their own codec, register the underlying type instead"
+        )
+    if hint is t.Literal or t.get_origin(hint) is t.Literal:
+        raise BytesOperationError("Can't register a codec for a Literal")
+    if hint is None or isinstance(hint, (str, t.ForwardRef, t.TypeVar)):
+        raise BytesOperationError(f"Can't register a codec for {hint!r}")
+    try:
+        hash(hint)
+    except TypeError:
+        raise BytesOperationError(
+            f"Can't register a codec for unhashable {hint!r}"
+        ) from None
+    if not override and (hint in _REGISTERED or hint in _FALLBACKS):
+        raise BytesOperationError(
+            f"{hint} already has a codec; pass override=True to replace it"
+        )
+    _REGISTERED[hint] = codec
+    _clear_caches()
+    return codec
+
+
+def unregister_codec(hint: t.Any) -> None:
+    "Remove a codec added by `register_codec`; no-op if there is none"
+    if _REGISTERED.pop(hint, None) is not None:
+        _clear_caches()
+
+
+def _clear_caches() -> None:
+    _CODECS.clear()
+    _PLAIN_CODECS.clear()
+
+
+def _registered(hint: t.Any, actual_hint: t.Any) -> Codec | None:
+    if not _REGISTERED:
+        return None
+    try:
+        codec = _REGISTERED.get(hint)
+        return codec if codec is not None else _REGISTERED.get(actual_hint)
+    except TypeError:  # unhashable hint
+        return None
+
+
 def _build_codec(hint: t.Any, compile: bool) -> Codec:
     global _COMPILE
     previous, _COMPILE = _COMPILE, compile
@@ -72,7 +147,11 @@ def _resolve_base_codec(hint: t.Any) -> Codec:
     if hint in _FALLBACKS:
         return _FALLBACKS[hint]
     if isinstance(hint, type) and issubclass(hint, enum.Enum):
+        # the codec of the value type (`int` for an IntEnum), registered
+        # overrides first
         for base in hint.__mro__:
+            if base in _REGISTERED:
+                return _REGISTERED[base]
             if base in _FALLBACKS:
                 return _FALLBACKS[base]
     # Literal primitives
@@ -201,7 +280,11 @@ def _resolve_literal(args: Args, context: ParserContext, meta: _Meta) -> Codec:
 
 def _resolve_enum(actual_hint: t.Any, meta: _Meta) -> EnumCodec:
     _reject_len(meta, actual_hint)
-    codec = meta.codec or _resolve_base_codec(actual_hint)
+    codec = (
+        meta.codec
+        if meta.codec is not None
+        else _resolve_base_codec(actual_hint)
+    )
     return EnumCodec(codec=codec, cls=actual_hint)
 
 
@@ -380,8 +463,12 @@ def _get_codec_inner(
     if meta.when is not None:
         raise BytesOperationError(f"When needs an optional type, got {hint}")
 
+    custom = _registered(hint, actual_hint) if meta.codec is None else None
     if actual_hint is t.Literal:
         codec = _resolve_literal(args, context, meta)
+    elif custom is not None:
+        _reject_len(meta, f"{hint} with a registered codec")
+        codec = custom
     elif isinstance(actual_hint, type) and issubclass(actual_hint, enum.Enum):
         codec = _resolve_enum(actual_hint, meta)
     elif meta.codec is not None:
