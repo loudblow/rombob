@@ -1,7 +1,5 @@
 """
 Annotations for `typing.Annotated` hints: lengths, constraints, conditions.
-
-This module has no dependencies: it only describes *what* the user asked for.
 Turning the annotations into codecs happens in `rombob.__init__`.
 """
 

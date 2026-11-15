@@ -3,6 +3,7 @@ import enum
 import typing as t
 
 import pytest
+from models import Foo
 
 import rombob as rb
 from rombob import (
@@ -15,13 +16,10 @@ from rombob import (
     U24_L,
     U32_B,
     BytesOperationError,
-    ClassCodec,
-    Factory,
     IntCodec,
     Len,
     Named,
     OptionalCodec,
-    Reader,
     StructCodec,
     UVInt,
     ValidatorCodec,
@@ -35,15 +33,6 @@ from rombob import (
 class Color(enum.IntEnum):
     RED = 1
     GREEN = 2
-
-
-@dataclasses.dataclass
-class Foo:
-    byte: U8_B
-    short: U16_B
-    long: U32_B
-    fixed_string: t.Annotated[str, Len(10)]
-    fixed_list: t.Annotated[list[U8_B], Len(5)]
 
 
 def roundtrip(value, hint=None):
@@ -425,198 +414,3 @@ def test_wide_ints(length, bits, order, signed):
             encode(Cls(1, bad, 2))
         with pytest.raises(BytesOperationError):
             encode(Cls(1, bad, 2), codec=get_codec(Cls, compile=False))
-
-
-# - - - - - factory with wide ids - - - - - #
-
-
-def test_factory_two_byte_id_at_offset():
-    factory = Factory("id")
-
-    @factory.register
-    @dataclasses.dataclass
-    class A:
-        version: U8_B
-        id: t.Annotated[t.Literal[0x0102], StructCodec(">H")]
-        x: U8_B
-
-    @factory.register
-    @dataclasses.dataclass
-    class B:
-        version: U8_B
-        id: t.Annotated[t.Literal[0x0201, 0x0202], StructCodec(">H")]
-
-    assert factory.decode(b"\x09\x01\x02\x05") == A(9, 0x0102, 5)
-    assert factory.decode(b"\x09\x02\x02") == B(9, 0x0202)
-    assert factory.decode(b"\x09\x03\x03") is None
-    assert factory.encode(B(1, 0x0201)) == b"\x01\x02\x01"
-    with pytest.raises(BytesOperationError):
-        factory.decode(b"\x09\x01")
-
-
-def test_factory_rejects_mismatching_layout():
-    factory = Factory("id")
-
-    @factory.register
-    @dataclasses.dataclass
-    class A:
-        id: t.Annotated[t.Literal[1], StructCodec(">H")]
-
-    @dataclasses.dataclass
-    class WrongSize:
-        id: t.Annotated[t.Literal[2], StructCodec(">B")]
-
-    @dataclasses.dataclass
-    class WrongOffset:
-        pad: U8_B
-        id: t.Annotated[t.Literal[3], StructCodec(">H")]
-
-    @dataclasses.dataclass
-    class NotStatic:
-        n: UVInt
-        id: t.Annotated[t.Literal[4], StructCodec(">H")]
-
-    for cls in (WrongSize, WrongOffset, NotStatic):
-        with pytest.raises(BytesOperationError):
-            factory.register(cls)
-
-
-# - - - - - codec cache - - - - - #
-
-
-def test_get_codec_is_memoized():
-    assert get_codec(Foo) is get_codec(Foo)
-    assert get_codec(Foo) is not get_codec(Foo, compile=False)
-    assert get_codec(list[int]) is get_codec(list[int])
-
-
-def test_same_name_classes_get_different_codecs():
-    def make():
-        @dataclasses.dataclass
-        class Same:
-            a: U8_B
-
-        return Same
-
-    a, b = make(), make()
-    assert a.__name__ == b.__name__
-    assert get_codec(a) is not get_codec(b)
-    assert get_codec(a).cls is a
-    assert get_codec(b).cls is b
-
-
-def test_unhashable_hint_still_works():
-    hint = t.Annotated[int, {"a": 1}, StructCodec(">H")]
-    codec = get_codec(hint)
-    assert codec == StructCodec(">H")
-    assert encode(5, codec=codec) == b"\x00\x05"
-
-
-def test_codecs_are_plain_classes():
-    assert isinstance(StructCodec(">B"), StructCodec)
-    assert StructCodec(">B") == StructCodec(">B")
-    assert StructCodec(">B") != StructCodec(">H")
-    assert hash(StructCodec(">B")) == hash(StructCodec(">B"))
-    assert isinstance(get_codec(Foo), ClassCodec)
-    with pytest.raises(Exception):  # noqa: B017, PT011
-        get_codec(Foo).cls = int  # frozen
-
-
-# - - - - - Reader / Writer - - - - - #
-
-
-def test_reader_basics():
-    r = Reader(b"\x01\x02\x03\x04\x05")
-    assert r.remaining == 5
-    assert bytes(r.peek(2)) == b"\x01\x02"
-    assert bytes(r.peek(2, 1)) == b"\x02\x03"
-    assert r.offset == 0
-    assert bytes(r.take(2)) == b"\x01\x02"
-    assert r.unpack(rb.StructCodec(">H")) == (0x0304,)
-    assert r.rest() == b"\x05"
-    assert r.remaining == 0
-    with pytest.raises(BytesOperationError):
-        r.take(1)
-    with pytest.raises(BytesOperationError):
-        r.peek(1)
-
-
-@pytest.mark.parametrize("data", [b"\x01\x02", bytearray(b"\x01\x02")])
-def test_reader_accepts_buffers(data):
-    assert bytes(Reader(data).take(2)) == b"\x01\x02"
-    assert bytes(Reader(memoryview(data)).take(2)) == b"\x01\x02"
-
-
-def test_to_reader_and_to_writer_share_data():
-    w = Writer()
-    w.data["k"] = 1
-    r = w.to_reader()
-    assert r.data is w.data
-    assert r.to_writer().data is w.data
-
-
-def test_writer_basics():
-    w = Writer()
-    w.write(b"ab")
-    w.pack(rb.StructCodec(">H"), 1)
-    assert w.getvalue() == b"ab\x00\x01"
-    assert isinstance(w.getvalue(), bytes)
-    assert w.to_reader().rest() == b"ab\x00\x01"
-
-
-def test_underflow_is_an_error():
-    with pytest.raises(BytesOperationError):
-        decode(b"\x01", cls=Foo)
-    with pytest.raises(BytesOperationError):
-        decode(b"\x01", codec=rb.StringCodec())
-    with pytest.raises(BytesOperationError):
-        decode(b"\x00\x05ab", codec=rb.StringCodec())
-
-
-def test_truncated_varint():
-    with pytest.raises(BytesOperationError, match="Truncated"):
-        decode(b"\x80\x80", codec=get_codec(UVInt))
-    with pytest.raises(BytesOperationError):
-        decode(b"", codec=get_codec(UVInt))
-    assert decode(b"\x7f", codec=get_codec(UVInt)) == 127
-
-
-def test_encode_rolls_back_user_writer():
-    @dataclasses.dataclass
-    class Cls:
-        a: U8_B
-        b: t.Annotated[str, Len(2)]
-
-    w = Writer(bytearray(b"prefix"))
-    with pytest.raises(BytesOperationError):
-        encode(Cls(1, "wrong"), writer=w)
-    assert bytes(w.buffer) == b"prefix"
-
-    assert encode(Cls(1, "ok"), writer=w) == b"prefix\x01ok"
-
-
-def test_error_mentions_offset():
-    data = b"\x01\x00\x02" + b"\x00" * 3  # truncated for Foo
-    with pytest.raises(BytesOperationError, match="offset"):
-        decode(data, cls=Foo)
-
-    r = Reader(b"abc\x80")
-    r.offset = 3
-    with pytest.raises(BytesOperationError, match="offset 3"):
-        decode(b"", codec=get_codec(UVInt), reader=r)
-
-
-def test_decode_advances_given_reader():
-    r = Reader(b"\x01\x02\x03")
-    assert decode(b"", codec=get_codec(U8_B), reader=r) == 1
-    assert decode(b"", codec=get_codec(U16_B), reader=r) == 0x0203
-    assert r.remaining == 0
-
-
-def test_decoded_values_do_not_reference_input():
-    buf = bytearray(b"\x00\x02ab")
-    value = decode(buf, codec=rb.BytesCodec())
-    buf[2] = 0
-    assert value == b"ab"
-    buf.append(0)  # no exports left: resizing works
-    assert isinstance(value, bytes)

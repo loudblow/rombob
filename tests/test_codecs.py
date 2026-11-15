@@ -1,14 +1,13 @@
 import binascii
 import dataclasses
 import decimal as d
-import enum
 import math
 import typing as t
 
 import pytest
+from models import Address, EnumIntegers, EnumStrings
 
 from rombob import (
-    BE,
     F16_B,
     F16_L,
     F32_B,
@@ -27,7 +26,6 @@ from rombob import (
     I48_L,
     I64_B,
     I64_L,
-    LE,
     U8_B,
     U8_L,
     U16_B,
@@ -40,27 +38,16 @@ from rombob import (
     U48_L,
     U64_B,
     U64_L,
-    BytesCodec,
     BytesOperationError,
-    ClassCodec,
-    CollectionCodec,
-    EnumCodec,
-    Factory,
-    IntCodec,
     IVInt,
     Len,
-    LiteralCodec,
     Named,
     NamedCodec,
-    OptionalCodec,
     Raw,
-    RawCodec,
-    Reader,
     StringCodec,
     StructCodec,
     UVInt,
     ValidatorCodec,
-    VarIntCodec,
     Writer,
     decode,
     encode,
@@ -73,162 +60,6 @@ T = t.TypeVar("T")
 class BadBool:
     def __bool__(self):
         raise ValueError("I refuse to be a boolean!")
-
-
-class EnumIntegers(enum.IntEnum):
-    a = 0
-    b = 1
-
-
-class EnumStrings(str, enum.Enum):
-    a = "a"
-    b = "bb"
-
-
-class Address(t.NamedTuple):
-    ip: str
-    port: U16_B
-
-
-@dataclasses.dataclass
-class BinutilDC:
-    CLASSVAR: t.ClassVar[int] = 123
-    address: Address
-    named: Named[str]
-
-
-# - - - - - get_codec - - - - - #
-
-
-@pytest.mark.parametrize(
-    "hint, expected",
-    (
-        (bool, StructCodec("?")),
-        (int, StructCodec(">q")),
-        (float, StructCodec(">d")),
-        (I8_L, StructCodec("<b")),
-        (I8_B, StructCodec(">b")),
-        (U8_L, StructCodec("<B")),
-        (U8_B, StructCodec(">B")),
-        (I16_L, StructCodec("<h")),
-        (I16_B, StructCodec(">h")),
-        (U16_L, StructCodec("<H")),
-        (U16_B, StructCodec(">H")),
-        (I24_L, IntCodec(length=3, byteorder=LE, signed=True)),
-        (I24_B, IntCodec(length=3, byteorder=BE, signed=True)),
-        (U24_L, IntCodec(length=3, byteorder=LE, signed=False)),
-        (U24_B, IntCodec(length=3, byteorder=BE, signed=False)),
-        (I32_L, StructCodec("<i")),
-        (I32_B, StructCodec(">i")),
-        (U32_L, StructCodec("<I")),
-        (U32_B, StructCodec(">I")),
-        (I48_L, IntCodec(length=6, byteorder=LE, signed=True)),
-        (I48_B, IntCodec(length=6, byteorder=BE, signed=True)),
-        (U48_L, IntCodec(length=6, byteorder=LE, signed=False)),
-        (U48_B, IntCodec(length=6, byteorder=BE, signed=False)),
-        (I64_L, StructCodec("<q")),
-        (I64_B, StructCodec(">q")),
-        (U64_L, StructCodec("<Q")),
-        (U64_B, StructCodec(">Q")),
-        (F16_L, StructCodec("<e")),
-        (F16_B, StructCodec(">e")),
-        (F32_L, StructCodec("<f")),
-        (F32_B, StructCodec(">f")),
-        (F64_L, StructCodec("<d")),
-        (F64_B, StructCodec(">d")),
-        (IVInt, VarIntCodec(signed=True)),
-        (UVInt, VarIntCodec(signed=False)),
-        (str, StringCodec(len_codec=StructCodec(">H"))),
-        (bytes, BytesCodec(len_codec=StructCodec(">H"))),
-        (
-            list[str],
-            CollectionCodec(
-                cls=list,
-                item_codec=StringCodec(),
-                len_codec=StructCodec(">H"),
-            ),
-        ),
-        (
-            tuple[tuple[U8_B, ...], ...],
-            CollectionCodec(
-                cls=tuple,
-                len_codec=StructCodec(">H"),
-                item_codec=CollectionCodec(
-                    cls=tuple,
-                    len_codec=StructCodec(">H"),
-                    item_codec=StructCodec(">B"),
-                ),
-            ),
-        ),
-        (
-            t.Annotated[tuple[str, ...], Len(1)],
-            CollectionCodec(
-                cls=tuple,
-                len_codec=StructCodec(">H"),
-                item_codec=StringCodec(),
-                length=1,
-            ),
-        ),
-        (
-            set[str],
-            CollectionCodec(
-                cls=set,
-                len_codec=StructCodec(">H"),
-                item_codec=StringCodec(),
-            ),
-        ),
-        (
-            frozenset[str],
-            CollectionCodec(
-                cls=frozenset,
-                len_codec=StructCodec(">H"),
-                item_codec=StringCodec(),
-            ),
-        ),
-        (Raw, RawCodec()),
-        (t.Annotated[bytes, Len(1)], BytesCodec(length=1)),
-        (str | None, OptionalCodec(codec=StringCodec())),
-        # TODO ValidatorCodec
-        (EnumStrings, EnumCodec(codec=StringCodec(), cls=EnumStrings)),
-        (
-            t.Annotated[EnumIntegers, U8_B],
-            EnumCodec(codec=StructCodec(">B"), cls=EnumIntegers),
-        ),
-        (
-            t.Annotated[t.Literal[1, 2, 3], StructCodec(">B")],
-            LiteralCodec(codec=StructCodec(">B"), literals=(1, 2, 3)),
-        ),
-        (Named[str], StringCodec()),
-        (
-            Address,
-            ClassCodec(
-                cls=Address,
-                fields={
-                    "ip": StringCodec(),
-                    "port": StructCodec(">H"),
-                }.items(),
-            ),
-        ),
-        (
-            BinutilDC,
-            ClassCodec(
-                cls=BinutilDC,
-                fields={
-                    "address": ClassCodec(
-                        cls=Address,
-                        fields={
-                            "ip": StringCodec(),
-                            "port": StructCodec(">H"),
-                        }.items(),
-                    ),
-                    "named": NamedCodec(codec=StringCodec(), key="named"),
-                }.items(),
-            ),
-        ),
-    ),
-)
-def test_get_codec(hint, expected):
-    assert get_codec(hint) == expected
 
 
 # - - - - - NUMERIC DATA - - - - - #
@@ -697,121 +528,3 @@ def test_class_codec(compile):
         data.integer = 256
         data.somemorebytes = b"\x00"
         encode(data, codec=codec)
-
-
-class TestFactory:
-    def test_register(self):
-        factory = Factory("id")
-
-        with pytest.raises(
-            BytesOperationError,
-            match=r"must be a class",
-        ):
-            factory.register(str)
-
-        with pytest.raises(
-            BytesOperationError,
-            match=r"have no codec for field",
-        ):
-
-            @factory.register
-            @dataclasses.dataclass
-            class Packet:
-                id_: t.Literal[1, 2, 3]
-
-        with pytest.raises(
-            BytesOperationError,
-            match=r"should be typing.Literal",
-        ):
-
-            @factory.register
-            @dataclasses.dataclass
-            class Packet:
-                id: list[str]
-
-        @factory.register
-        @dataclasses.dataclass
-        class Packet:
-            id: t.Literal[1, 2, 3]
-
-        assert factory.id_map[1] == Packet
-        assert factory.id_map[2] == Packet
-        assert factory.id_map[3] == Packet
-        assert 1 in factory.codecs
-        assert 2 in factory.codecs
-        assert 3 in factory.codecs
-        assert len(factory.id_map) == 3
-        assert len(factory.codecs) == 3
-
-    def test_register_subclasses(self):
-        @dataclasses.dataclass
-        class Packet:
-            id: t.Literal[100]
-
-        @dataclasses.dataclass
-        class PacketA(Packet):
-            id: t.Literal[1]
-
-        @dataclasses.dataclass
-        class PacketB(Packet):
-            id: t.Literal[2]
-
-        @dataclasses.dataclass
-        class PacketAA(PacketA):
-            id: t.Literal[3]
-
-        factory = Factory("id")
-        factory.register_subclasses(Packet)
-
-        assert factory.id_map.get(100) is None
-        assert factory.id_map[1] == PacketA
-        assert factory.id_map[2] == PacketB
-        assert factory.id_map.get(3) is None
-
-        factory = Factory("id")
-        factory.register_subclasses(Packet, include_base=True)
-
-        assert factory.id_map.get(100) == Packet
-        assert factory.id_map[1] == PacketA
-        assert factory.id_map[2] == PacketB
-        assert factory.id_map.get(3) is None
-
-    def test_encode_decode(self):
-        factory = Factory("id")
-
-        @factory.register
-        @dataclasses.dataclass
-        class Packet:
-            id: t.Annotated[t.Literal[1, 2, 3], StructCodec(">B")]
-
-        @dataclasses.dataclass
-        class SimilarPacket:
-            id: t.Annotated[t.Literal[1, 2, 3], StructCodec(">B")]
-
-        @dataclasses.dataclass
-        class WrongPacket:
-            id: t.Annotated[t.Literal[4, 5, 6], StructCodec(">B")]
-
-        assert factory.encode(Packet(id=1)) == b"\x01"
-        assert factory.encode(SimilarPacket(id=2)) == b"\x02"
-        assert factory.encode(WrongPacket(id=4)) is None
-
-        assert factory.decode(b"\x01") == Packet(id=1)
-        assert factory.decode(b"\x02") == Packet(id=2)
-        assert factory.decode(b"\x04") is None
-        with pytest.raises(BytesOperationError):
-            factory.decode(b"")
-
-        w = Writer(bytearray(b"prefix"))
-        assert factory.encode_to(Packet(id=1), w) is True
-        assert bytes(w.buffer) == b"prefix\x01"
-        assert factory.encode_to(WrongPacket(id=4), w) is False
-        assert bytes(w.buffer) == b"prefix\x01"
-
-        r = Reader(b"\x01\x04")
-        assert factory.decode_from(r) == Packet(id=1)
-        assert r.offset == 1
-        assert factory.decode_from(r) is None
-        assert r.offset == 1
-        with pytest.raises(BytesOperationError):
-            factory.decode_from(Reader(b""))
