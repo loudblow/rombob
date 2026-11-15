@@ -45,7 +45,7 @@ The library is configured primarily through **Type Annotations**:
 - **Byte Order:** Use `LE` (Little Endian) or `BE` (Big Endian) via `IntCodec`.
 - **Length Overrides:** Use `Annotated[str, Len(10)]` to force a fixed-length field without a length header.
 - **Optional Fields:** `Optional[T]` or `T | None` will trigger `OptionalCodec`, which checks the buffer length or a custom predicate before reading.
-- **Custom Context:** The `Context` class can be initialized with a pre-existing buffer or a custom `data` dict to influence how `NamedCodec` behaves.
+- **Reader / Writer:** `Reader` and `Writer` hold the buffer position and a shared `data` dict (used by `NamedCodec` and `OptionalCodec` predicates). Pass `reader=`/`writer=` to `decode`/`encode` to continue an existing buffer.
 
 ## Supported Data Types
 Fields on the classes can be bools, integers, floats, strings, bytes, lists, tuples, sets, frozensets, named tuples, or other dataclasses:

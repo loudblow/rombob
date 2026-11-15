@@ -45,7 +45,6 @@ from rombob import (
     BytesOperationError,
     ClassCodec,
     CollectionCodec,
-    Context,
     EnumCodec,
     Factory,
     IntCodec,
@@ -56,11 +55,13 @@ from rombob import (
     OptionalCodec,
     Raw,
     RawCodec,
+    Reader,
     StringCodec,
     StructCodec,
     UVInt,
     ValidatorCodec,
     VarIntCodec,
+    Writer,
     decode,
     encode,
     get_codec,
@@ -359,21 +360,22 @@ def test_get_codec(hint, expected):
 )
 def test_numeric_write_read(hint, cls, min, max, expected, expected_len):
     codec = get_codec(hint)
-    ctx = Context(buffer=bytearray())
-    ctx.write(codec, min)
-    ctx.write(codec, max)
-    assert bytes(ctx.buffer) == binascii.unhexlify(expected)
-    assert len(ctx.buffer) == expected_len
+    w = Writer()
+    codec.write(min, w)
+    codec.write(max, w)
+    assert bytes(w.buffer) == binascii.unhexlify(expected)
+    assert len(w.buffer) == expected_len
 
+    r = w.to_reader()
     for value in (min, max):
-        read_value = ctx.read(codec)
+        read_value = codec.read(r)
         assert isinstance(read_value, cls)
         if math.isnan(read_value):
             assert math.isnan(read_value) == math.isnan(value)
         else:
             assert read_value == value
 
-    assert len(ctx.buffer) == 0
+    assert r.remaining == 0
 
 
 @pytest.mark.parametrize(
@@ -414,13 +416,13 @@ def test_numeric_write_read(hint, cls, min, max, expected, expected_len):
     ),
 )
 def test_numeric_wrong_data_size(hint, min, max):
-    ctx = Context(bytearray())
+    w = Writer()
     codec = get_codec(hint)
     with pytest.raises(BytesOperationError):
-        ctx.write(codec, min)
+        encode(min, codec=codec, writer=w)
     with pytest.raises(BytesOperationError):
-        ctx.write(codec, max)
-    assert len(ctx.buffer) == 0
+        encode(max, codec=codec, writer=w)
+    assert len(w.buffer) == 0
 
 
 @pytest.mark.parametrize(
@@ -462,12 +464,12 @@ def test_numeric_wrong_data_size(hint, min, max):
     ),
 )
 def test_numeric_wrong_data_type(hint, values):
-    ctx = Context(bytearray())
+    w = Writer()
     codec = get_codec(hint)
     for v in values:
         with pytest.raises(BytesOperationError):
-            ctx.write(codec, v)
-    assert len(ctx.buffer) == 0
+            encode(v, codec=codec, writer=w)
+    assert len(w.buffer) == 0
 
 
 # - - - - - SEQUENCED DATA - - - - - #
@@ -543,16 +545,16 @@ def test_numeric_wrong_data_type(hint, values):
 )
 def test_sequence_write_read(hint, cls, value, expected, expected_len):
     codec = get_codec(hint)
-    ctx = Context(buffer=bytearray())
-    ctx.write(codec, value)
-    assert bytes(ctx.buffer) == binascii.unhexlify(expected)
-    assert len(ctx.buffer) == expected_len
+    w = Writer()
+    encode(value, codec=codec, writer=w)
+    assert bytes(w.buffer) == binascii.unhexlify(expected)
+    assert len(w.buffer) == expected_len
 
-    ctx.buffer = memoryview(ctx.buffer)
-    read_value = ctx.read(codec)
+    r = w.to_reader()
+    read_value = codec.read(r)
     assert read_value == value
     assert isinstance(read_value, cls)
-    assert len(ctx.buffer) == 0
+    assert r.remaining == 0
 
 
 @pytest.mark.parametrize(
@@ -572,10 +574,10 @@ def test_sequence_write_read(hint, cls, value, expected, expected_len):
 )
 def test_sequence_wrong_data_size(hint, value):
     codec = get_codec(hint)
-    ctx = Context(bytearray())
+    w = Writer()
     with pytest.raises(BytesOperationError):
-        ctx.write(codec, value)
-    assert len(ctx.buffer) == 0
+        encode(value, codec=codec, writer=w)
+    assert len(w.buffer) == 0
 
 
 @pytest.mark.parametrize(
@@ -610,10 +612,10 @@ def test_sequence_wrong_data_size(hint, value):
 )
 def test_sequence_wrong_data_type(hint, value):
     codec = get_codec(hint)
-    ctx = Context(bytearray())
+    w = Writer()
     with pytest.raises(BytesOperationError):
-        ctx.write(codec, value)
-    assert len(ctx.buffer) == 0
+        encode(value, codec=codec, writer=w)
+    assert len(w.buffer) == 0
 
 
 @pytest.mark.parametrize(
@@ -621,15 +623,16 @@ def test_sequence_wrong_data_type(hint, value):
     ((NamedCodec(codec=StringCodec(), key="first_name"), "Zaza"),),
 )
 def test_named(codec, value):
-    ctx = Context()
-    ctx.write(codec, value)
-    assert codec.key in ctx.data
-    assert ctx.data[codec.key] == value
+    w = Writer()
+    encode(value, codec=codec, writer=w)
+    assert codec.key in w.data
+    assert w.data[codec.key] == value
 
-    ctx = Context(bytearray(ctx.buffer))
-    assert ctx.read(codec) == value
-    assert codec.key in ctx.data
-    assert ctx.data[codec.key] == value
+    r = w.to_reader()
+    assert codec.read(r) == value
+    assert codec.key in r.data
+    assert r.data[codec.key] == value
+    assert r.data is w.data
 
 
 @dataclasses.dataclass
@@ -679,10 +682,9 @@ def test_class_codec():
         optional=None,
     )
     codec = get_codec(ManyTypesDC[bool])
-    ctx = Context()
-    ctx.write(codec, data)
-    ctx.buffer = memoryview(ctx.buffer)
-    assert ctx.read(codec) == data
+    w = Writer()
+    codec.write(data, w)
+    assert codec.read(w.to_reader()) == data
 
     dd = encode(data, codec=codec)
     assert decode(dd, codec=codec) == data
@@ -690,7 +692,7 @@ def test_class_codec():
     with pytest.raises(BytesOperationError):
         data.integer = 256
         data.somemorebytes = b"\x00"
-        Context().write(codec, data)
+        encode(data, codec=codec)
 
 
 class TestFactory:
@@ -796,11 +798,11 @@ class TestFactory:
         with pytest.raises(BytesOperationError):
             factory.decode(b"")
 
-        ctx = Context(buffer=bytearray(b"prefix"))
-        result = factory.encode(Packet(id=1), ctx=ctx)
+        w = Writer(bytearray(b"prefix"))
+        result = factory.encode(Packet(id=1), writer=w)
         assert result == b"prefix\x01"
-        assert bytes(ctx.buffer) == b"prefix\x01"
+        assert bytes(w.buffer) == b"prefix\x01"
 
-        ctx = Context(memoryview(b"\x01"))
-        result = factory.decode(ctx)
+        r = Reader(b"\x01")
+        result = factory.decode(r)
         assert result == Packet(id=1)

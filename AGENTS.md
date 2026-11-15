@@ -21,11 +21,17 @@ poetry run pytest tests/test_basic.py -v -k test_name
 
 ## Architecture
 - **Package**: `src/rombob/` (single package, entry via `__init__.py`)
-- **Tests**: `tests/test_basic.py`
+- **Tests**: `tests/test_basic.py`, `tests/test_compiler.py`
 - **API**: `rombob.encode(value)` / `rombob.decode(data, cls)`
 
 ## Codec Caching
-All `Codec` classes are cached via `@cache` (from `functools.lru_cache`). This means codec instances are memoized - the same codec is returned for identical type hints. Tests involving codec state should account for this.
+Codec classes are plain classes with value-based `__eq__`/`__hash__` (frozen dataclasses, `StructCodec` compares by format). Constructors do not intern instances. Memoization lives in `get_codec(hint)`, which caches per hint (unhashable hints are built without caching). Codecs must be stateless: all per-call state lives in `Reader`/`Writer`, so one codec can be shared freely. `get_codec(hint, compile=False)` returns the plain, non-compiled codecs (used by tests to compare against the compiled path).
+
+## Compiler
+`ClassCodec` for dataclasses/NamedTuples groups consecutive fixed-size fields (struct types, 24/48-bit ints, fixed `str`/`bytes`/collections, literals, enums, validators, nested all-fixed classes) into struct segments and generates `read`/`write` source (`codec.source`). See `repr(get_codec(cls))` for the segment layout.
+
+## Benchmarks
+`benchmarks/bench.py` (end-to-end encode/decode) and `benchmarks/bench_int24.py`.
 
 ## Language Policy
 - Reply to the user in the language the user is communicating in.
