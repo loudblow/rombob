@@ -3,7 +3,6 @@ import enum
 import typing as t
 
 import pytest
-from annotated_types import Len
 
 import rombob as rb
 from rombob import (
@@ -19,6 +18,7 @@ from rombob import (
     ClassCodec,
     Factory,
     IntCodec,
+    Len,
     Named,
     OptionalCodec,
     Reader,
@@ -196,7 +196,7 @@ class Everything:
     flag: bool
     text: t.Annotated[str, Len(4)]
     raw: t.Annotated[bytes, Len(2)]
-    arr: t.Annotated[tuple[rb.I16_L], Len(3)]
+    arr: t.Annotated[tuple[rb.I16_L, ...], Len(3)]
     named: Named[U8_B]
     validated: t.Annotated[
         int,
@@ -381,8 +381,10 @@ def test_zero_length_fixed_str_and_bytes():
         s: t.Annotated[str, Len(0)]
         n: U8_B
 
-    # Len(0) means "no explicit length": falls back to a prefixed string
-    assert roundtrip(Cls("x", 1)) == b"\x00\x01x\x01"
+    # Len(0) is a string of exactly zero bytes
+    assert roundtrip(Cls("", 1)) == b"\x01"
+    with pytest.raises(BytesOperationError):
+        encode(Cls("x", 1))
 
     codec = rb.StringCodec(length=0)
     assert decode(b"rest", codec=codec) == ""

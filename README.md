@@ -41,11 +41,16 @@ print(decoded_player.username)  # Archer
 ```
 
 ## Configuration Options
-The library is configured primarily through **Type Annotations**:
+The library is configured primarily through **Type Annotations** (all of them
+live in `rombob.metadata` and are importable from `rombob`):
 - **Byte Order:** Use `LE` (Little Endian) or `BE` (Big Endian) via `IntCodec`.
-- **Length Overrides:** Use `Annotated[str, Len(10)]` to force a fixed-length field without a length header.
-- **Optional Fields:** `Optional[T]` or `T | None` will trigger `OptionalCodec`, which checks the buffer length or a custom predicate before reading.
-- **Reader / Writer:** `Reader` and `Writer` hold the buffer position and a shared `data` dict (used by `NamedCodec` and `OptionalCodec` predicates). Pass `reader=`/`writer=` to `decode`/`encode` to continue an existing buffer.
+- **Length:** `Annotated[str, Len(10)]` is exactly 10 bytes, no length header. `Len(ref="count")` takes the length from an earlier `Named` field (or from `Len(ref=lambda ctx: ...)`), and writing checks that it matches. `Prefix(U8_B)` changes the integer the length is stored with (U16 big-endian by default). `Len` works for `str`, `bytes`, collections and `str`/`bytes` literals.
+- **Literals:** `Literal[b"MAGIC"]` and `Literal["ab", "cd"]` need no codec, their size is known. Only integer literals need an explicit one, e.g. `Annotated[Literal[1, 2], U8_B]`.
+- **Constraints:** `Gt`, `Ge`, `Lt`, `Le`, `Range(lo, hi)` and `Predicate(func)` are checked when reading and when writing, e.g. `Annotated[U8_B, Range(1, 10)]`.
+- **Optional Fields:** `Optional[T]` or `T | None` is present while there is data left. `Annotated[T | None, When(lambda ctx: "token" in ctx.data)]` (or `When(ref="has_token")`) makes presence depend on earlier `Named` fields; writing a value that disagrees with the condition fails.
+- **Skipped Fields:** `Skip[int]` fields (they need a default) are neither read nor written. `ClassVar`s are ignored as well.
+- **Reader / Writer:** `Reader` and `Writer` hold the buffer position and a shared `data` dict (filled by `Named` fields). Pass `reader=`/`writer=` to `decode`/`encode` to continue an existing buffer.
+- **Errors:** pass `trace_errors=True` to `encode`/`decode` (or `Codec.encode`, etc.) to get the failing field in the message, e.g. `Msg.header.items[3].name`. The value is run once more on a slower path, only when it failed.
 
 ## Supported Data Types
 Fields on the classes can be bools, integers, floats, strings, bytes, lists, tuples, sets, frozensets, named tuples, or other dataclasses:
@@ -73,7 +78,8 @@ from rombob import (
 `Rombob` also supports Python typing features:
 - `typing.Literal`
 - `typing.Generic` and `typing.TypeVar`
-- Fixed- and dynamic-length `str`, `bytes`, `list`, `tuple`, `set`, `frozenset`
+- Fixed- and dynamic-length `str`, `bytes`, `list`, `tuple[X, ...]`, `set`, `frozenset`
+- Heterogeneous tuples: `tuple[int, str]`
 - `typing.NamedTuple`
 - `t.Optional`
 - `dataclasses.dataclass`

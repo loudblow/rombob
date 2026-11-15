@@ -6,7 +6,6 @@ import math
 import typing as t
 
 import pytest
-from annotated_types import Len
 
 from rombob import (
     BE,
@@ -49,6 +48,7 @@ from rombob import (
     Factory,
     IntCodec,
     IVInt,
+    Len,
     LiteralCodec,
     Named,
     NamedCodec,
@@ -149,7 +149,7 @@ class BinutilDC:
             ),
         ),
         (
-            tuple[tuple[U8_B]],
+            tuple[tuple[U8_B, ...], ...],
             CollectionCodec(
                 cls=tuple,
                 len_codec=StructCodec(">H"),
@@ -161,7 +161,7 @@ class BinutilDC:
             ),
         ),
         (
-            t.Annotated[tuple[str], Len(1)],
+            t.Annotated[tuple[str, ...], Len(1)],
             CollectionCodec(
                 cls=tuple,
                 len_codec=StructCodec(">H"),
@@ -358,24 +358,24 @@ def test_get_codec(hint, expected):
         (UVInt, int, 16383, 16384, b"ff7f808001", 5),
     ),
 )
-def test_numeric_write_read(hint, cls, min, max, expected, expected_len):
-    codec = get_codec(hint)
+def test_numeric_write_read(
+    subject, hint, cls, min, max, expected, expected_len
+):
+    s = subject(hint, 2)
     w = Writer()
-    codec.write(min, w)
-    codec.write(max, w)
+    s.encode_to((min, max), w)
     assert bytes(w.buffer) == binascii.unhexlify(expected)
     assert len(w.buffer) == expected_len
 
-    r = w.to_reader()
-    for value in (min, max):
-        read_value = codec.read(r)
+    values = s.decode(bytes(w.buffer))
+    for read_value, value in zip(values, (min, max), strict=True):
         assert isinstance(read_value, cls)
-        if math.isnan(read_value):
-            assert math.isnan(read_value) == math.isnan(value)
+        if isinstance(value, float) and math.isnan(value):
+            assert math.isnan(read_value)
+        elif isinstance(value, float):
+            assert read_value == pytest.approx(value)
         else:
             assert read_value == value
-
-    assert r.remaining == 0
 
 
 @pytest.mark.parametrize(
@@ -415,13 +415,13 @@ def test_numeric_write_read(hint, cls, min, max, expected, expected_len):
         (UVInt, -1, -1),
     ),
 )
-def test_numeric_wrong_data_size(hint, min, max):
+def test_numeric_wrong_data_size(subject, hint, min, max):
+    s = subject(hint)
     w = Writer()
-    codec = get_codec(hint)
     with pytest.raises(BytesOperationError):
-        encode(min, codec=codec, writer=w)
+        s.encode_to((min,), w)
     with pytest.raises(BytesOperationError):
-        encode(max, codec=codec, writer=w)
+        s.encode_to((max,), w)
     assert len(w.buffer) == 0
 
 
@@ -463,12 +463,12 @@ def test_numeric_wrong_data_size(hint, min, max):
         (IVInt, [""]),
     ),
 )
-def test_numeric_wrong_data_type(hint, values):
+def test_numeric_wrong_data_type(subject, hint, values):
+    s = subject(hint)
     w = Writer()
-    codec = get_codec(hint)
     for v in values:
         with pytest.raises(BytesOperationError):
-            encode(v, codec=codec, writer=w)
+            s.encode_to((v,), w)
     assert len(w.buffer) == 0
 
 
@@ -485,7 +485,7 @@ def test_numeric_wrong_data_type(hint, values):
         (Raw, bytes, b"\x7f", b"7f", 1),
         (t.Annotated[bytes, Len(2)], bytes, b"\x7f\x7f", b"7f7f", 2),
         (list[str], list, ["Hello", "Hi"], b"0002000548656c6c6f00024869", 13),
-        (tuple[IVInt], tuple, (0, 0, 1), b"0003000002", 5),
+        (tuple[IVInt, ...], tuple, (0, 0, 1), b"0003000002", 5),
         (set[IVInt], set, {0}, b"000100", 3),
         # TODO
         # (
@@ -501,7 +501,13 @@ def test_numeric_wrong_data_type(hint, values):
             b"000548656c6c6f00024869",
             11,
         ),
-        (t.Annotated[tuple[I8_B], Len(3)], tuple, (-128, 0, 127), b"80007f", 3),
+        (
+            t.Annotated[tuple[I8_B, ...], Len(3)],
+            tuple,
+            (-128, 0, 127),
+            b"80007f",
+            3,
+        ),
         (
             t.Annotated[
                 int,
@@ -543,18 +549,16 @@ def test_numeric_wrong_data_type(hint, values):
         (I8_B | None, type(None), None, b"", 0),
     ),
 )
-def test_sequence_write_read(hint, cls, value, expected, expected_len):
-    codec = get_codec(hint)
+def test_sequence_write_read(subject, hint, cls, value, expected, expected_len):
+    s = subject(hint)
     w = Writer()
-    encode(value, codec=codec, writer=w)
+    s.encode_to((value,), w)
     assert bytes(w.buffer) == binascii.unhexlify(expected)
     assert len(w.buffer) == expected_len
 
-    r = w.to_reader()
-    read_value = codec.read(r)
+    (read_value,) = s.decode(bytes(w.buffer))
     assert read_value == value
     assert isinstance(read_value, cls)
-    assert r.remaining == 0
 
 
 @pytest.mark.parametrize(
@@ -567,16 +571,16 @@ def test_sequence_write_read(hint, cls, value, expected, expected_len):
         (t.Annotated[bytes, Len(2)], b"\x7f"),
         (list[I8_B], [1] * 65536),
         (t.Annotated[list[str], Len(2)], ["Hello"]),
-        (t.Annotated[tuple[I8_B], Len(3)], [-128, 0, 127, 0]),
+        (t.Annotated[tuple[I8_B, ...], Len(3)], [-128, 0, 127, 0]),
         (I8_B | None, 128),
     ),
     ids=["a", "b", "c", "d", "e", "f", "g", "j", "k"],
 )
-def test_sequence_wrong_data_size(hint, value):
-    codec = get_codec(hint)
+def test_sequence_wrong_data_size(subject, hint, value):
+    s = subject(hint)
     w = Writer()
     with pytest.raises(BytesOperationError):
-        encode(value, codec=codec, writer=w)
+        s.encode_to((value,), w)
     assert len(w.buffer) == 0
 
 
@@ -610,11 +614,11 @@ def test_sequence_wrong_data_size(hint, value):
         (EnumStrings, EnumStrings),
     ),
 )
-def test_sequence_wrong_data_type(hint, value):
-    codec = get_codec(hint)
+def test_sequence_wrong_data_type(subject, hint, value):
+    s = subject(hint)
     w = Writer()
     with pytest.raises(BytesOperationError):
-        encode(value, codec=codec, writer=w)
+        s.encode_to((value,), w)
     assert len(w.buffer) == 0
 
 
@@ -662,7 +666,7 @@ class ManyTypesDC(t.Generic[T]):
     optional: Raw | None = None
 
 
-def test_class_codec():
+def test_class_codec(compile):
     data = ManyTypesDC[bool](
         strenum=EnumStrings.b,
         intenum=EnumIntegers.a,
@@ -681,7 +685,7 @@ def test_class_codec():
         somemorebytes=b"\x00\x00",
         optional=None,
     )
-    codec = get_codec(ManyTypesDC[bool])
+    codec = get_codec(ManyTypesDC[bool], compile=compile)
     w = Writer()
     codec.write(data, w)
     assert codec.read(w.to_reader()) == data

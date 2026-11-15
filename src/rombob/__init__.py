@@ -8,10 +8,36 @@ import struct as s
 import types
 import typing as t
 
-from annotated_types import Len
+from .metadata import (
+    CONSTRAINTS,
+    NAMED,
+    SKIP,
+    Ge,
+    Gt,
+    Le,
+    Len,
+    Lt,
+    Named,
+    Predicate,
+    Prefix,
+    Range,
+    Skip,
+    When,
+)
 
 __all__ = [
     "Named",
+    "Skip",
+    "Len",
+    "Prefix",
+    "Gt",
+    "Ge",
+    "Lt",
+    "Le",
+    "Range",
+    "Predicate",
+    "When",
+    "RefLenCodec",
     "BytesOperationError",
     "Reader",
     "Writer",
@@ -81,9 +107,6 @@ T = t.TypeVar("T")
 B = t.TypeVar("B")
 EnumT = t.TypeVar("EnumT", bound=enum.Enum)
 Buffer = t.Union[bytes, bytearray, memoryview]  # noqa: UP007
-
-_NAMED_MARKER = "__rombob__NamedMarker__"
-Named = t.Annotated[T, _NAMED_MARKER]
 
 
 class BytesOperationError(Exception):
@@ -227,47 +250,71 @@ class Codec(t.Generic[T]):
     def read(self, r: Reader) -> T:
         raise NotImplementedError
 
-    def encode(self, value: T) -> bytes:
-        """Encode the value into new bytes."""
+    def encode(self, value: T, *, trace_errors: bool = False) -> bytes:
+        """
+        Encode the value into new bytes.
+
+        :param trace_errors: on failure, run the value once more through
+            a slower, non-compiled path to name the failing field in the
+            error, e.g. `Msg.header.items[3]`. Costs nothing unless it fails.
+        """
         w = Writer()
         try:
             self.write(value, w)
         except Exception as exc:
             raise BytesOperationError(
-                f"Encoding failed at length {len(w.buffer)}: {exc}"
+                _encode_message(
+                    self, value, len(w.buffer), None, exc, trace_errors
+                )
             ) from exc
         return bytes(w.buffer)
 
-    def encode_to(self, value: T, w: Writer) -> None:
-        """Append the encoded value to `w`. On failure `w` is left intact."""
+    def encode_to(
+        self, value: T, w: Writer, *, trace_errors: bool = False
+    ) -> None:
+        """
+        Append the encoded value to `w`. On failure `w` is left intact.
+        See `encode` for `trace_errors`.
+        """
         start = len(w.buffer)
+        shared = dict(w.data) if trace_errors else None
         try:
             self.write(value, w)
         except Exception as exc:
             del w.buffer[start:]
             raise BytesOperationError(
-                f"Encoding failed at length {len(w.buffer)}: {exc}"
+                _encode_message(
+                    self, value, len(w.buffer), shared, exc, trace_errors
+                )
             ) from exc
 
-    def decode(self, data: Buffer) -> T:
-        """Decode a value from the start of `data`."""
+    def decode(self, data: Buffer, *, trace_errors: bool = False) -> T:
+        """
+        Decode a value from the start of `data`.
+        See `encode` for `trace_errors`.
+        """
         r = Reader(data)
         try:
             return self.read(r)
         except Exception as exc:
             raise BytesOperationError(
-                f"Decoding failed at offset {r.offset}: {exc}"
+                _decode_message(self, r, 0, None, exc, trace_errors)
             ) from exc
         finally:
             r.release()
 
-    def decode_from(self, r: Reader) -> T:
-        """Decode a value at the reader's offset and advance it."""
+    def decode_from(self, r: Reader, *, trace_errors: bool = False) -> T:
+        """
+        Decode a value at the reader's offset and advance it.
+        See `encode` for `trace_errors`.
+        """
+        start = r.offset
+        shared = dict(r.data) if trace_errors else None
         try:
             return self.read(r)
         except Exception as exc:
             raise BytesOperationError(
-                f"Decoding failed at offset {r.offset}: {exc}"
+                _decode_message(self, r, start, shared, exc, trace_errors)
             ) from exc
 
 
@@ -509,9 +556,32 @@ class RawCodec(Codec[bytes]):
         return r.rest()
 
 
+def _tuple_size_error(got: int, expected: int) -> BytesOperationError:
+    return BytesOperationError(
+        f"Wrong tuple size, got {got}, expected {expected}"
+    )
+
+
+def _optional_missing(name: str = "") -> BytesOperationError:
+    return BytesOperationError(
+        f"{name or 'The value'} is None but its When condition holds"
+    )
+
+
+def _optional_extra(name: str = "") -> BytesOperationError:
+    return BytesOperationError(
+        f"{name or 'The value'} is set but its When condition doesn't hold"
+    )
+
+
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
 class OptionalCodec(Codec[T]):
-    "Read/write if predicate is True"
+    """
+    Without a predicate: read if there is data left, write if not None.
+    With a predicate (see `When`): the field is present exactly when the
+    predicate, called with the Reader/Writer, is true. Writing a value that
+    disagrees with it is an error.
+    """
 
     codec: Codec[T]
     predicate: t.Callable[[Reader | Writer], bool] | None = None
@@ -524,11 +594,83 @@ class OptionalCodec(Codec[T]):
 
     def write(self, value: T | None, w: Writer) -> None:
         if self.predicate:
-            if self.predicate(w) and value is not None:
+            if self.predicate(w):
+                if value is None:
+                    raise _optional_missing()
                 self.codec.write(value, w)
+            elif value is not None:
+                raise _optional_extra()
+        elif value is not None:
+            self.codec.write(value, w)
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class _RefTruthy:
+    "`When(ref=...)`: the named field is truthy"
+
+    ref: str
+
+    def __call__(self, ctx: Reader | Writer) -> bool:
+        try:
+            return bool(ctx.data[self.ref])
+        except KeyError:
+            raise BytesOperationError(
+                f"When(ref={self.ref!r}): no earlier field is "
+                f"annotated with Named under that name"
+            ) from None
+
+
+@dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
+class RefLenCodec(Codec[int]):
+    """
+    A length that isn't stored but known from the context: an earlier
+    `Named` field, or `ref(ctx)`. It's the `len_codec` of the string, bytes
+    and collection codecs for `Len(ref=...)`. Reading returns the length,
+    writing checks the actual length against it and writes nothing.
+    """
+
+    ref: str | t.Callable[[t.Any], int]
+
+    def _get(self, ctx: Reader | Writer) -> int:
+        if isinstance(self.ref, str):
+            try:
+                n = ctx.data[self.ref]
+            except KeyError:
+                raise BytesOperationError(
+                    f"Len(ref={self.ref!r}): no earlier field is "
+                    f"annotated with Named under that name"
+                ) from None
         else:
-            if value is not None:
-                self.codec.write(value, w)
+            n = self.ref(ctx)
+        if not isinstance(n, int) or n < 0:
+            raise BytesOperationError(
+                f"Len(ref={self.ref!r}) is not a valid length: {n!r}"
+            )
+        return n
+
+    def read(self, r: Reader) -> int:
+        return self._get(r)
+
+    def write(self, value: int, w: Writer) -> None:
+        expected = self._get(w)
+        if value != expected:
+            raise BytesOperationError(
+                f"Wrong value length: got {value}, "
+                f"Len(ref={self.ref!r}) says {expected}"
+            )
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class _Check:
+    "All the constraints of a field, as a read/write validator"
+
+    constraints: tuple
+
+    def __call__(self, value: t.Any) -> t.Any:
+        for c in self.constraints:
+            if not c.ok(value):
+                raise BytesOperationError(f"{value!r} violates {c}")
+        return value
 
 
 @dataclasses.dataclass(slots=True, kw_only=True, frozen=True)
@@ -1010,7 +1152,11 @@ class _GroupSpec(_Spec):
         return self.info.expr(self.names, exprs, env)
 
     def write(self, x: str, env: _Env, out: list[str]) -> list[str]:
-        getter = env.bind("get", operator.attrgetter(*self.names))
+        if self.info.kind == "anon":
+            err = env.bind("Err", _tuple_size_error)
+            n = len(self.names)
+            out.append(f"if len({x}) != {n}: raise {err}(len({x}), {n})")
+        getter = env.bind("get", self.info.getter(self.names))
         tmps = [env.tmp("g") for _ in self.names]
         target = ", ".join(tmps)
         if len(tmps) == 1:
@@ -1077,7 +1223,9 @@ class _CtorInfo:
         self.names = names
         cls = self.cls
         self.kind = "kw"
-        if (
+        if cls is tuple:  # an anonymous tuple[X, Y]: fields are the items
+            self.kind = "anon"
+        elif (
             isinstance(cls, type)
             and issubclass(cls, tuple)
             and hasattr(cls, "_fields")
@@ -1093,7 +1241,15 @@ class _CtorInfo:
             ):
                 self.kind = "pos"
 
+    def getter(self, names: t.Sequence[str]) -> t.Callable[[t.Any], t.Any]:
+        "Returns the field values of an instance (one value if one field)"
+        if self.kind == "anon":
+            return operator.itemgetter(*range(len(names)))
+        return operator.attrgetter(*names)
+
     def make(self, values: t.Sequence[t.Any]) -> t.Any:
+        if self.kind == "anon":
+            return tuple(values)
         if self.kind == "pos":
             return self.cls(*values)
         if self.kind == "tuple":
@@ -1101,6 +1257,8 @@ class _CtorInfo:
         return self.cls(**dict(zip(self.names, values, strict=True)))
 
     def expr(self, names: t.Sequence[str], exprs: list[str], env: _Env) -> str:
+        if self.kind == "anon":
+            return f"({''.join(e + ', ' for e in exprs)})"
         cls = env.bind("cls", self.cls)
         if self.kind == "pos":
             return f"{cls}({', '.join(exprs)})"
@@ -1324,9 +1482,13 @@ def _gen_write(
     info: _CtorInfo, entries: list[_Entry], segments: list[Segment], env: _Env
 ) -> str:
     lines: list[str] = []
+    if info.kind == "anon":
+        err = env.bind("Err", _tuple_size_error)
+        n = len(info.names)
+        lines.append(f"    if len(value) != {n}: raise {err}(len(value), {n})")
     if entries:
         names = info.names
-        getter = env.bind("get", operator.attrgetter(*names))
+        getter = env.bind("get", info.getter(names))
         targets = ", ".join(e.var for e in entries)
         lines.append(f"    {targets} = {getter}(value)")
     lines.append("    buf = w.buffer")
@@ -1352,15 +1514,25 @@ def _gen_write(
             assert spec is not None
             codec = entry.codec
             assert isinstance(codec, OptionalCodec)
-            cond = f"{entry.var} is not None"
-            if codec.predicate is not None:
-                cond = f"{env.bind('pred', codec.predicate)}(w) and {cond}"
             out = []
             args = spec.write(entry.var, env, out)
             pack = env.bind("p", _struct(seg.format).pack)
             body = out + [f"buf += {pack}({', '.join(args)})"]
-            lines.append(f"    if {cond}:")
-            lines += _indent(body, 2)
+            if codec.predicate is not None:
+                pred = env.bind("pred", codec.predicate)
+                missing = env.bind("miss", _optional_missing)
+                extra = env.bind("extra", _optional_extra)
+                lines.append(f"    if {pred}(w):")
+                lines.append(
+                    f"        if {entry.var} is None: "
+                    f"raise {missing}({entry.name!r})"
+                )
+                lines += _indent(body, 2)
+                lines.append(f"    elif {entry.var} is not None:")
+                lines.append(f"        raise {extra}({entry.name!r})")
+            else:
+                lines.append(f"    if {entry.var} is not None:")
+                lines += _indent(body, 2)
             lines += _indent(set_named(entry))
         else:
             entry = seg.entry
@@ -1416,15 +1588,19 @@ def _plain_funcs(
     writes = tuple(c.write for _, c in fields)
     make = info.make
     names = tuple(n for n, _ in fields)
-    getter = operator.attrgetter(*names) if names else None
+    getter = info.getter(names) if names else None
     single = len(names) == 1
 
     def read(r: Reader) -> t.Any:
         return make([f(r) for f in reads])
 
+    anon = info.kind == "anon"
+
     def write(value: t.Any, w: Writer) -> None:
         if getter is None:
             return
+        if anon and len(value) != len(names):
+            raise _tuple_size_error(len(value), len(names))
         values = (getter(value),) if single else getter(value)
         for f, v in zip(writes, values, strict=True):
             f(v, w)
@@ -1589,9 +1765,7 @@ def _build_codec(hint: t.Any, compile: bool) -> Codec:
         _COMPILE = previous
 
 
-def _resolve_base_codec(hint: t.Any, explicit_codec: Codec | None) -> Codec:
-    if explicit_codec is not None:
-        return explicit_codec
+def _resolve_base_codec(hint: t.Any) -> Codec:
     if hint in _FALLBACKS:
         return _FALLBACKS[hint]
     if isinstance(hint, type) and issubclass(hint, enum.Enum):
@@ -1604,23 +1778,127 @@ def _resolve_base_codec(hint: t.Any, explicit_codec: Codec | None) -> Codec:
     raise BytesOperationError(f"No fallback codec for {hint}")
 
 
-def _resolve_literal(
-    args: Args, context: ParserContext, explicit_codec: Codec | None
-) -> Codec:
-    codec = (
-        explicit_codec
-        if explicit_codec
-        else _get_codec_inner(type(args[0]), context)
-    )
-    return LiteralCodec(codec=codec, literals=args)
+# ---------------------------------------------------------------------------
+# Metadata of a hint
+#
+# `Annotated[...]` layers are peeled off first and their metadata is merged
+# into one `_Meta`; only then is the base type dispatched. That keeps the
+# annotations independent of the shape of the type (`X | None`, aliases of
+# `Annotated`, type variables).
+# ---------------------------------------------------------------------------
 
 
-def _resolve_enum(actual_hint: t.Any, explicit_codec: Codec) -> EnumCodec:
-    codec = (
-        explicit_codec
-        if explicit_codec
-        else _resolve_base_codec(actual_hint, explicit_codec)
-    )
+@dataclasses.dataclass(slots=True)
+class _Meta:
+    codec: Codec | None = None
+    length: Len | None = None
+    prefix: Prefix | None = None
+    checks: list = dataclasses.field(default_factory=list)
+    when: When | None = None
+    named: bool = False
+    skip: bool = False
+
+    def copy(self) -> "_Meta":
+        return dataclasses.replace(self, checks=list(self.checks))
+
+    def for_inner(self) -> "_Meta":
+        "What an `X | None` hands down to X: all but the optional's own"
+        rv = self.copy()
+        rv.when = None
+        rv.named = False
+        return rv
+
+
+def _set_once(meta: _Meta, attr: str, value: t.Any) -> None:
+    if getattr(meta, attr) is not None:
+        raise BytesOperationError(
+            f"{type(value).__name__} is given more than once"
+        )
+    setattr(meta, attr, value)
+
+
+def _collect(items: t.Iterable[t.Any], meta: _Meta, context: dict) -> None:
+    for item in items:
+        if isinstance(item, Codec):
+            meta.codec = item  # the last one wins, so aliases can be refined
+        elif isinstance(item, Len):
+            _set_once(meta, "length", item)
+        elif isinstance(item, Prefix):
+            _set_once(meta, "prefix", item)
+        elif isinstance(item, CONSTRAINTS):
+            meta.checks.append(item)
+        elif isinstance(item, When):
+            _set_once(meta, "when", item)
+        elif item is NAMED:
+            meta.named = True
+        elif item is SKIP:
+            meta.skip = True
+        elif t.get_origin(item) is t.Annotated:
+            # an alias such as U16_L used as the metadata
+            try:
+                meta.codec = _get_codec_inner(item, context)
+            except BytesOperationError:
+                pass
+        # anything else belongs to someone else, ignore it
+
+
+def _is_skipped(hint: t.Any) -> bool:
+    return t.get_origin(hint) is t.Annotated and SKIP in t.get_args(hint)[1:]
+
+
+def _len_kwargs(meta: _Meta, context: dict) -> dict[str, t.Any]:
+    "Constructor arguments of the str/bytes/collection codecs"
+    if meta.length is not None and meta.prefix is not None:
+        raise BytesOperationError("Len and Prefix can't be used together")
+    if meta.length is not None:
+        if meta.length.n is not None:
+            return {"length": meta.length.n}
+        return {"len_codec": RefLenCodec(ref=meta.length.ref)}
+    if meta.prefix is not None:
+        codec = meta.prefix.codec
+        if not isinstance(codec, Codec):
+            codec = _get_codec_inner(codec, context)
+        return {"len_codec": codec}
+    return {}
+
+
+def _reject_len(meta: _Meta, hint: t.Any) -> None:
+    if meta.length is not None or meta.prefix is not None:
+        raise BytesOperationError(f"Len and Prefix don't apply to {hint}")
+
+
+def _resolve_literal(args: Args, context: ParserContext, meta: _Meta) -> Codec:
+    args = tuple(args)
+    if meta.codec is not None:
+        _reject_len(meta, "a Literal with an explicit codec")
+        return LiteralCodec(codec=meta.codec, literals=args)
+    kind = type(args[0])
+    if kind not in (str, bytes):
+        _reject_len(meta, f"Literal of {kind.__name__}")
+        return LiteralCodec(
+            codec=_get_codec_inner(kind, context), literals=args
+        )
+    # str/bytes literals know their size, no need to spell it out
+    cls = StringCodec if kind is str else BytesCodec
+    kwargs = _len_kwargs(meta, context)
+    sizes = {
+        len(a.encode("utf-8") if kind is str else a)
+        for a in args
+        if isinstance(a, kind)
+    }
+    if not kwargs:
+        if len(sizes) == 1:
+            kwargs = {"length": next(iter(sizes))}
+    elif kwargs.get("length") is not None and sizes != {kwargs["length"]}:
+        raise BytesOperationError(
+            f"Len({kwargs['length']}) doesn't match the Literal {list(args)}"
+        )
+    return LiteralCodec(codec=cls(**kwargs), literals=args)
+
+
+def _resolve_enum(actual_hint: t.Any, meta: _Meta) -> EnumCodec:
+    _reject_len(meta, actual_hint)
+    codec = meta.codec or _resolve_base_codec(actual_hint)
     return EnumCodec(codec=codec, cls=actual_hint)
 
 
@@ -1638,16 +1916,36 @@ def _class_codec(
     new_context = dict(context)
     if hasattr(actual_hint, "__parameters__") and args:
         new_context.update(zip(actual_hint.__parameters__, args, strict=False))
-    fields = {
-        name: _get_codec_inner(f_hint, new_context, field_name=name)
-        for name, f_hint in get_fields(new_context).items()
-    }
+    fields = {}
+    for name, f_hint in get_fields(new_context).items():
+        if _is_skipped(f_hint):
+            _check_has_default(actual_hint, name)
+            continue
+        fields[name] = _get_codec_inner(f_hint, new_context, field_name=name)
     codec = ClassCodec(
         cls=hint, fields=tuple(fields.items()), compiled=_COMPILE
     )
     if cacheable:
         cache[hint] = codec
     return codec
+
+
+def _check_has_default(cls: t.Any, name: str) -> None:
+    "A skipped field is never read, so the class must be able to do without"
+    if dataclasses.is_dataclass(cls):
+        f = dataclasses.fields(cls)
+        f = next((x for x in f if x.name == name), None)
+        ok = f is not None and (
+            not f.init
+            or f.default is not dataclasses.MISSING
+            or f.default_factory is not dataclasses.MISSING
+        )
+    else:
+        ok = name in getattr(cls, "_field_defaults", {})
+    if not ok:
+        raise BytesOperationError(
+            f"{cls.__name__}.{name} is Skip but has no default value"
+        )
 
 
 def _resolve_class(
@@ -1693,110 +1991,232 @@ def _dataclass_hints(cls: t.Any) -> dict[str, t.Any]:
 
 
 def _resolve_collection(
-    actual_hint: t.Any, args: Args, context: ParserContext, length: int | None
-) -> CollectionCodec:
-    item_hint = args[0] if args else t.Any
-    item_codec = _get_codec_inner(item_hint, context)
+    hint: t.Any,
+    actual_hint: t.Any,
+    args: Args,
+    context: ParserContext,
+    meta: _Meta,
+) -> Codec:
+    args = tuple(args)
+    if actual_hint is tuple and args and Ellipsis not in args:
+        # tuple[int, str]: a fixed record of different types
+        _reject_len(meta, hint)
+        fields = tuple(
+            (f"_{i}", _get_codec_inner(a, context)) for i, a in enumerate(args)
+        )
+        return ClassCodec(cls=hint, fields=fields, compiled=_COMPILE)
+    if Ellipsis in args and not (len(args) == 2 and args[1] is Ellipsis):
+        raise BytesOperationError(f"Unsupported tuple {hint}")
+    if not args:
+        raise BytesOperationError(f"The item type of {hint} is not given")
+    item_codec = _get_codec_inner(args[0], context)
     return CollectionCodec(
-        cls=actual_hint, item_codec=item_codec, length=length
+        cls=actual_hint, item_codec=item_codec, **_len_kwargs(meta, context)
     )
 
 
 def _resolve_optional(
-    args: Args, context: ParserContext, field_name: str | None
-) -> OptionalCodec:
+    args: Args, context: ParserContext, meta: _Meta, field_name: str | None
+) -> Codec:
     other_args = [a for a in args if a is not type(None)]
     other = (
         other_args[0] if len(other_args) == 1 else t.Union[tuple(other_args)]  # noqa: UP007
     )
-    inner_codec = _get_codec_inner(other, context, field_name)
-    return OptionalCodec(codec=inner_codec)
+    inner = _get_codec_inner(other, context, meta=meta.for_inner())
+    predicate: t.Callable | None = None
+    if meta.when is not None:
+        predicate = meta.when.predicate or _RefTruthy(meta.when.ref)
+    codec = OptionalCodec(codec=inner, predicate=predicate)
+    # the constraints went down to the inner type: `None` is never checked
+    return _finish(codec, _Meta(named=meta.named), field_name)
+
+
+def _finish(codec: Codec, meta: _Meta, field_name: str | None) -> Codec:
+    if meta.checks:
+        check = _Check(tuple(meta.checks))
+        codec = ValidatorCodec(
+            codec=codec, read_validator=check, write_validator=check
+        )
+    if meta.named and field_name is not None:
+        codec = NamedCodec(codec=codec, key=field_name)
+    return codec
 
 
 def _get_codec_inner(
-    hint: t.Any, context: dict[t.TypeVar, t.Any], field_name: str | None = None
+    hint: t.Any,
+    context: dict[t.TypeVar, t.Any],
+    field_name: str | None = None,
+    meta: _Meta | None = None,
 ) -> Codec:
-    if isinstance(hint, t.TypeVar):
-        hint = context.get(hint, hint)
+    meta = _Meta() if meta is None else meta.copy()
+    while True:
+        if isinstance(hint, t.TypeVar):
+            hint = context.get(hint, hint)
+        if t.get_origin(hint) is not t.Annotated:
+            break
+        args = t.get_args(hint)
+        _collect(args[1:], meta, context)
+        hint = args[0]
 
     if isinstance(hint, (str, t.ForwardRef)):
         # Class fields are resolved via get_type_hints before reaching here,
         # so this is a bare string hint with no namespace to resolve it in.
         raise BytesOperationError(f"Unresolved forward reference {hint!r}")
+    if meta.skip:
+        raise BytesOperationError("Skip is only allowed on class fields")
 
     origin = t.get_origin(hint)
     args = t.get_args(hint)
     actual_hint = origin if origin is not None else hint
-    if (
-        actual_hint is t.Union
-        or actual_hint is getattr(types, "UnionType", object)
-    ) and type(None) in args:
-        return _resolve_optional(
-            args=args, context=context, field_name=field_name
-        )
-
-    explicit_codec = None
-    length_override = None
-    is_named = False
-    if actual_hint is t.Annotated:
-        base_type = args[0]
-        metadata = args[1:]
-        for meta in metadata:
-            if isinstance(meta, Codec):
-                explicit_codec = meta
-            elif isinstance(meta, Len):
-                if meta.min_length > 0:
-                    length_override = meta.min_length
-            elif isinstance(meta, str) and meta == _NAMED_MARKER:
-                is_named = True
-            elif t.get_origin(meta) is t.Annotated:
-                # If metadata is Annotated
-                try:
-                    explicit_codec = _get_codec_inner(meta, context)
-                except BytesOperationError:
-                    pass
-        hint = base_type
-        origin = t.get_origin(hint)
-        args = t.get_args(hint)
-        actual_hint = origin if origin is not None else hint
+    if actual_hint is t.Union or actual_hint is getattr(
+        types, "UnionType", object
+    ):
+        if type(None) not in args:
+            raise BytesOperationError(f"Unsupported union {hint}")
+        return _resolve_optional(args, context, meta, field_name)
+    if meta.when is not None:
+        raise BytesOperationError(f"When needs an optional type, got {hint}")
 
     if actual_hint is t.Literal:
-        codec = _resolve_literal(
-            args=args, context=context, explicit_codec=explicit_codec
-        )
+        codec = _resolve_literal(args, context, meta)
     elif isinstance(actual_hint, type) and issubclass(actual_hint, enum.Enum):
-        codec = _resolve_enum(
-            actual_hint=actual_hint, explicit_codec=explicit_codec
-        )
+        codec = _resolve_enum(actual_hint, meta)
+    elif meta.codec is not None:
+        _reject_len(meta, f"{hint} with an explicit codec")
+        codec = meta.codec
+    elif not isinstance(actual_hint, type):
+        raise BytesOperationError(f"No fallback codec for {hint}")
     elif issubclass(actual_hint, tuple) and hasattr(actual_hint, "_fields"):
-        codec = _resolve_class(
-            hint=hint, actual_hint=actual_hint, args=args, context=context
-        )
+        _reject_len(meta, hint)
+        codec = _resolve_class(hint, actual_hint, args, context)
     elif dataclasses.is_dataclass(actual_hint):
-        codec = _resolve_dataclass(
-            hint=hint, actual_hint=actual_hint, args=args, context=context
-        )
+        _reject_len(meta, hint)
+        codec = _resolve_dataclass(hint, actual_hint, args, context)
     elif issubclass(actual_hint, (list, set, frozenset, tuple)):
-        codec = _resolve_collection(
-            actual_hint=actual_hint,
-            args=args,
-            context=context,
-            length=length_override,
-        )
-    elif issubclass(actual_hint, (str, bytes)) and length_override is not None:
-        if issubclass(actual_hint, str):
-            codec = StringCodec(length=length_override)
-        elif issubclass(actual_hint, bytes):
-            codec = BytesCodec(length=length_override)
-    elif explicit_codec is not None:
-        codec = explicit_codec
+        codec = _resolve_collection(hint, actual_hint, args, context, meta)
+    elif actual_hint is str:
+        codec = StringCodec(**_len_kwargs(meta, context))
+    elif actual_hint is bytes:
+        codec = BytesCodec(**_len_kwargs(meta, context))
     else:
-        codec = _resolve_base_codec(actual_hint, explicit_codec)
+        _reject_len(meta, hint)
+        codec = _resolve_base_codec(actual_hint)
 
-    if is_named and field_name is not None:
-        codec = NamedCodec(codec=codec, key=field_name)
+    return _finish(codec, meta, field_name)
 
+
+# ---------------------------------------------------------------------------
+# Error tracing (`trace_errors=True`)
+#
+# To say *where* an operation failed, it is run once more on a copy of the
+# codec tree whose children are wrapped in proxies. The copy is never
+# compiled, and every proxy records the path (`.field`, `[index]`) it is
+# working on; when something raises, the path of the failure is left behind.
+# The normal path pays nothing for this.
+# ---------------------------------------------------------------------------
+
+
+class _TraceProxy(Codec):
+    __slots__ = ("codec", "path", "label", "items", "index")
+
+    def __init__(
+        self, codec: Codec, path: list[str], label: str, items: bool = False
+    ) -> None:
+        self.codec = codec
+        self.path = path
+        self.label = label
+        self.items = items
+        self.index = 0
+
+    def _push(self) -> bool:
+        if self.items:
+            self.path.append(f"[{self.index}]")
+            self.index += 1
+        elif self.label:
+            self.path.append(self.label)
+        else:
+            return False
+        return True
+
+    def read(self, r: Reader) -> t.Any:
+        pushed = self._push()
+        value = _traced(self.codec, self.path).read(r)
+        if pushed:
+            self.path.pop()
+        return value
+
+    def write(self, value: t.Any, w: Writer) -> None:
+        pushed = self._push()
+        _traced(self.codec, self.path).write(value, w)
+        if pushed:
+            self.path.pop()
+
+
+_WRAPPERS = (OptionalCodec, ValidatorCodec, LiteralCodec, EnumCodec, NamedCodec)
+
+
+def _traced(codec: Codec, path: list[str]) -> Codec:
+    "A copy of the codec whose children record their path"
+    typ = type(codec)
+    if typ is ClassCodec:
+        fields = tuple(
+            (n, _TraceProxy(c, path, f".{n}")) for n, c in codec.fields
+        )
+        return ClassCodec(cls=codec.cls, fields=fields, compiled=False)
+    if typ is CollectionCodec:
+        item = _TraceProxy(codec.item_codec, path, "", items=True)
+        return dataclasses.replace(codec, item_codec=item)
+    if typ in _WRAPPERS:
+        return dataclasses.replace(
+            codec, codec=_TraceProxy(codec.codec, path, "")
+        )
     return codec
+
+
+def _format_path(codec: Codec, path: list[str]) -> str:
+    root = _display_name(codec.cls) if type(codec) is ClassCodec else ""
+    rv = root + "".join(path)
+    return rv[1:] if rv.startswith(".") else rv
+
+
+def _decode_message(
+    codec: Codec,
+    r: Reader,
+    start: int,
+    shared: dict[str, t.Any] | None,
+    exc: Exception,
+    trace: bool,
+) -> str:
+    if trace:
+        path: list[str] = []
+        r2 = Reader(r.view, start, shared)
+        try:
+            _traced(codec, path).read(r2)
+        except Exception:
+            where = _format_path(codec, path)
+            at = f" ({where})" if where else ""
+            return f"Decoding failed at offset {r2.offset}{at}: {exc}"
+    return f"Decoding failed at offset {r.offset}: {exc}"
+
+
+def _encode_message(
+    codec: Codec,
+    value: t.Any,
+    length: int,
+    shared: dict[str, t.Any] | None,
+    exc: Exception,
+    trace: bool,
+) -> str:
+    if trace:
+        path: list[str] = []
+        w2 = Writer(shared=shared)
+        try:
+            _traced(codec, path).write(value, w2)
+        except Exception:
+            where = _format_path(codec, path)
+            at = f" ({where})" if where else ""
+            return f"Encoding failed at length {len(w2.buffer)}{at}: {exc}"
+    return f"Encoding failed at length {length}: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -1961,11 +2381,14 @@ def encode(
     codec: Codec[T] | None = None,
     cls: type[T] | None = None,
     writer: Writer | None = None,
+    *,
+    trace_errors: bool = False,
 ) -> bytes:
     """
     Encode the value. Returns the whole content of the writer's buffer
     (just the encoded value unless a `writer` with data is given).
     On failure nothing is left in the user-supplied writer.
+    `trace_errors`: see `Codec.encode`.
     """
     if codec is None:
         try:
@@ -1973,8 +2396,8 @@ def encode(
         except Exception as exc:
             raise BytesOperationError(f"Encoding failed: {exc}") from exc
     if writer is None:
-        return codec.encode(value)
-    codec.encode_to(value, writer)
+        return codec.encode(value, trace_errors=trace_errors)
+    codec.encode_to(value, writer, trace_errors=trace_errors)
     return bytes(writer.buffer)
 
 
@@ -1983,10 +2406,12 @@ def decode(
     codec: Codec[T] | None = None,
     cls: type[T] | None = None,
     reader: Reader | None = None,
+    *,
+    trace_errors: bool = False,
 ) -> T:
     """
     Decode a value from `data`, or from the `reader` if it is provided
-    (the reader's offset is advanced).
+    (the reader's offset is advanced). `trace_errors`: see `Codec.encode`.
     """
     if not (codec or cls):
         raise ValueError(
@@ -1999,5 +2424,5 @@ def decode(
         except Exception as exc:
             raise BytesOperationError(f"Decoding failed: {exc}") from exc
     if reader is None:
-        return codec.decode(data)
-    return codec.decode_from(reader)
+        return codec.decode(data, trace_errors=trace_errors)
+    return codec.decode_from(reader, trace_errors=trace_errors)
