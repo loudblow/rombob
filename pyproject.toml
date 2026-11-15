@@ -1,6 +1,6 @@
 [project]
 name = "rombob"
-version = "1.0.0"
+version = "1.1.0"
 description = "Fast binary serialization, driven by plain type hints."
 authors = [
     {name = "loudblow", email = "145815114+loudblow@users.noreply.github.com"}

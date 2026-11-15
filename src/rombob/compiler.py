@@ -194,6 +194,13 @@ class _IntSpec(_Spec):
         return value.to_bytes(c.length, c.byteorder, signed=c.signed)
 
 
+def _sized(raw: bytes, length: int) -> bytes:
+    "Raw bytes of a fixed-size value; a wrong size can't be matched on bytes"
+    if len(raw) != length:
+        raise BytesOperationError(f"Expected {length} bytes, got {len(raw)}")
+    return raw
+
+
 class _StrSpec(_Spec):
     order = None
     nslots = 1
@@ -217,6 +224,9 @@ class _StrSpec(_Spec):
         )
         return [tmp]
 
+    def packed(self, value: t.Any) -> bytes:
+        return _sized(value.encode(), self.length)
+
 
 class _BytesSpec(_Spec):
     order = None
@@ -238,6 +248,9 @@ class _BytesSpec(_Spec):
             f'expected {self.length}")'
         )
         return [x]
+
+    def packed(self, value: t.Any) -> bytes:
+        return _sized(bytes(value), self.length)
 
 
 def _leaf_item(codec: Codec) -> tuple[str | None, str] | None:
@@ -339,6 +352,10 @@ class _EnumSpec(_Spec):
         out.append(f"{tmp} = {mapping}[{x}]")
         return self.inner.write(tmp, env, out)
 
+    def packed(self, value: t.Any) -> bytes:
+        raw = value.value if self.maps is None else self.maps[1][value]
+        return self.inner.packed(raw)
+
 
 class _ValidatorSpec(_Spec):
     def __init__(self, inner: _Spec, codec: ValidatorCodec) -> None:
@@ -437,12 +454,12 @@ def _to_spec(codec: t.Any) -> _Spec | None:
         return _ArraySpec(codec.cls, codec.length, *leaf)
     if typ is LiteralCodec:
         inner = _to_spec(codec.codec)
-        if inner is None or inner.nslots != 1:
+        if inner is None:
             return None
         return _LiteralSpec(inner, codec.literals)
     if typ is EnumCodec:
         inner = _to_spec(codec.codec)
-        if inner is None or inner.nslots != 1 or codec._maps is None:
+        if inner is None or codec._maps is None:
             return None
         return _EnumSpec(inner, codec.cls, codec._maps)
     if typ is ValidatorCodec:

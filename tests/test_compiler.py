@@ -8,6 +8,9 @@ from models import Foo
 import rombob as rb
 from rombob import (
     BE,
+    F32_B,
+    I24_B,
+    I48_L,
     LE,
     U8_B,
     U16_B,
@@ -15,11 +18,15 @@ from rombob import (
     U24_B,
     U24_L,
     U32_B,
+    U48_B,
+    BytesCodec,
     BytesOperationError,
+    EnumCodec,
     IntCodec,
     Len,
     Named,
     OptionalCodec,
+    StringCodec,
     StructCodec,
     UVInt,
     ValidatorCodec,
@@ -414,3 +421,235 @@ def test_wide_ints(length, bits, order, signed):
             encode(Cls(1, bad, 2))
         with pytest.raises(BytesOperationError):
             encode(Cls(1, bad, 2), codec=get_codec(Cls, compile=False))
+
+
+# - - - - - literals/enums over every fixed-size codec - - - - - #
+
+
+class StrEnum_(enum.Enum):
+    AB = "ab"
+    CD = "cd"
+
+
+class BytesEnum_(enum.Enum):
+    AB = b"ab"
+    CD = b"cd"
+
+
+# (hint, good value, good bytes, bad bytes)
+LITERAL_CASES = {
+    "u8": (t.Annotated[t.Literal[1, 2], U8_B], 2, b"\x02", b"\x03"),
+    "u24": (
+        t.Annotated[t.Literal[1, 2], U24_B],
+        2,
+        b"\x00\x00\x02",
+        b"\x00\x00\x03",
+    ),
+    "u24_le": (
+        t.Annotated[t.Literal[0x010203], U24_L],
+        0x010203,
+        b"\x03\x02\x01",
+        b"\x00\x00\x00",
+    ),
+    "i24": (
+        t.Annotated[t.Literal[-2], I24_B],
+        -2,
+        b"\xff\xff\xfe",
+        b"\x00\x00\x01",
+    ),
+    "u48": (
+        t.Annotated[t.Literal[5], U48_B],
+        5,
+        b"\x00\x00\x00\x00\x00\x05",
+        b"\x00\x00\x00\x00\x00\x06",
+    ),
+    "f32": (
+        t.Annotated[t.Literal[1.5], F32_B],
+        1.5,
+        b"\x3f\xc0\x00\x00",
+        b"\x00\x00\x00\x00",
+    ),
+    "bool": (
+        t.Annotated[t.Literal[True], StructCodec("?")],
+        True,
+        b"\x01",
+        b"\x00",
+    ),
+    "str": (t.Annotated[t.Literal["ab", "cd"], Len(2)], "cd", b"cd", b"zz"),
+    "bytes": (t.Annotated[t.Literal[b"ab"], Len(2)], b"ab", b"ab", b"zz"),
+    "int_enum_u8": (
+        t.Annotated[
+            t.Literal[Color.GREEN],
+            EnumCodec(codec=StructCodec(">B"), cls=Color),
+        ],
+        Color.GREEN,
+        b"\x02",
+        b"\x01",
+    ),
+    "int_enum_u24": (
+        t.Annotated[
+            t.Literal[Color.GREEN],
+            EnumCodec(codec=U24_B.__metadata__[0], cls=Color),
+        ],
+        Color.GREEN,
+        b"\x00\x00\x02",
+        b"\x00\x00\x01",
+    ),
+    "int_enum_i48": (
+        t.Annotated[
+            t.Literal[Color.RED],
+            EnumCodec(codec=I48_L.__metadata__[0], cls=Color),
+        ],
+        Color.RED,
+        b"\x01\x00\x00\x00\x00\x00",
+        b"\x02\x00\x00\x00\x00\x00",
+    ),
+    "str_enum": (
+        t.Annotated[
+            t.Literal[StrEnum_.CD],
+            EnumCodec(codec=StringCodec(length=2), cls=StrEnum_),
+        ],
+        StrEnum_.CD,
+        b"cd",
+        b"ab",
+    ),
+    "bytes_enum": (
+        t.Annotated[
+            t.Literal[BytesEnum_.AB],
+            EnumCodec(codec=BytesCodec(length=2), cls=BytesEnum_),
+        ],
+        BytesEnum_.AB,
+        b"ab",
+        b"cd",
+    ),
+}
+
+
+# floats and bools can't be matched on raw bytes (-0.0 == 0.0, 2 is True), so
+# they are checked after unpacking
+NO_FAIL_FAST = {"f32", "bool"}
+
+
+@pytest.mark.parametrize("name", LITERAL_CASES)
+def test_literal_matrix_compiled_matches_plain(name):
+    hint, value, good, bad = LITERAL_CASES[name]
+
+    @dataclasses.dataclass
+    class Cls:
+        id: hint  # type: ignore[valid-type]
+        tail: U8_B = 0
+
+    assert roundtrip(Cls(value, 9)) == good + b"\x09"
+    for compile in (True, False):
+        codec = get_codec(Cls, compile=compile)
+        with pytest.raises(BytesOperationError, match="Literal"):
+            decode(bad + b"\x09", codec=codec)
+        assert decode(good + b"\x09", codec=codec) == Cls(value, 9)
+    if name not in NO_FAIL_FAST:
+        # the literal is checked before the rest of the buffer is touched
+        with pytest.raises(BytesOperationError, match="Literal"):
+            decode(bad, codec=get_codec(Cls))
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "u8",
+        "u24",
+        "u24_le",
+        "i24",
+        "u48",
+        "int_enum_u8",
+        "int_enum_u24",
+        "int_enum_i48",
+    ],
+)
+def test_factory_accepts_every_fixed_int_literal(name):
+    hint, value, good, bad = LITERAL_CASES[name]
+    factory = rb.Factory("id")
+
+    @factory.register
+    @dataclasses.dataclass
+    class Cls:
+        id: hint  # type: ignore[valid-type]
+        tail: U8_B = 0
+
+    assert factory.encode(Cls(value, 4)) == good + b"\x04"
+    assert factory.decode(good + b"\x04") == Cls(value, 4)
+    assert factory.decode(bad + b"\x04") is None
+
+
+# - - - - - enums and validators over every fixed-size codec - - - - - #
+
+ENUM_CASES = {
+    "u8": (
+        Color,
+        StructCodec(">B"),
+        {Color.RED: b"\x01", Color.GREEN: b"\x02"},
+    ),
+    "u24": (
+        Color,
+        U24_B.__metadata__[0],
+        {Color.RED: b"\x00\x00\x01", Color.GREEN: b"\x00\x00\x02"},
+    ),
+    "i48_le": (
+        Color,
+        I48_L.__metadata__[0],
+        {
+            Color.RED: b"\x01\x00\x00\x00\x00\x00",
+            Color.GREEN: b"\x02\x00\x00\x00\x00\x00",
+        },
+    ),
+    "str": (
+        StrEnum_,
+        StringCodec(length=2),
+        {StrEnum_.AB: b"ab", StrEnum_.CD: b"cd"},
+    ),
+    "bytes": (
+        BytesEnum_,
+        BytesCodec(length=2),
+        {BytesEnum_.AB: b"ab", BytesEnum_.CD: b"cd"},
+    ),
+}
+
+
+@pytest.mark.parametrize("name", ENUM_CASES)
+def test_enum_matrix_compiled_matches_plain(name):
+    enum_cls, inner, raws = ENUM_CASES[name]
+    hint = t.Annotated[enum_cls, inner]
+
+    @dataclasses.dataclass
+    class Cls:
+        a: hint  # type: ignore[valid-type]
+        b: U8_B
+        c: hint  # type: ignore[valid-type]
+
+    first, second = list(raws)
+    value = Cls(first, 7, second)
+    data = roundtrip(value)
+    assert data == raws[first] + b"\x07" + raws[second]
+    assert type(decode(data, codec=get_codec(Cls)).a) is enum_cls
+    bad = bytes(len(raws[first]))
+    if name in ("str", "bytes"):
+        bad = b"zz"
+    for compile in (True, False):
+        codec = get_codec(Cls, compile=compile)
+        with pytest.raises(BytesOperationError):
+            decode(bad + b"\x07" + raws[second], codec=codec)
+        with pytest.raises(BytesOperationError):
+            decode(raws[first] + b"\x07" + bad, codec=codec)
+
+
+def test_validator_over_wide_ints_compiled_matches_plain():
+    @dataclasses.dataclass
+    class Cls:
+        a: t.Annotated[int, U24_B, rb.Gt(5)]
+        b: t.Annotated[int, I48_L, rb.Lt(100)]
+
+    roundtrip(Cls(6, -3))
+    for compile in (True, False):
+        codec = get_codec(Cls, compile=compile)
+        with pytest.raises(BytesOperationError):
+            decode(b"\x00\x00\x01" + bytes(6), codec=codec)
+        with pytest.raises(BytesOperationError):
+            encode(Cls(6, 100), codec=codec)

@@ -1,9 +1,11 @@
 import dataclasses
+import enum
 import typing as t
 
 import pytest
 from models import Address, EnumIntegers, EnumStrings, Foo
 
+import rombob
 from rombob import (
     BE,
     F16_B,
@@ -38,7 +40,9 @@ from rombob import (
     U64_B,
     U64_L,
     BytesCodec,
+    BytesOperationError,
     ClassCodec,
+    Codec,
     CollectionCodec,
     EnumCodec,
     IntCodec,
@@ -241,3 +245,193 @@ def test_codecs_are_plain_classes():
     assert isinstance(get_codec(Foo), ClassCodec)
     with pytest.raises(Exception):  # noqa: B017, PT011
         get_codec(Foo).cls = int  # frozen
+
+
+# - - - - - custom codecs registry - - - - - #
+
+
+class SystemAddress:
+    def __init__(self, host: str, port: int) -> None:
+        self.host, self.port = host, port
+
+    def __eq__(self, other):
+        return (self.host, self.port) == (other.host, other.port)
+
+
+class SystemAddressCodec(Codec[SystemAddress]):
+    def read(self, r):
+        raw = bytes(r.take(6))
+        return SystemAddress(
+            ".".join(str(b) for b in raw[:4]), int.from_bytes(raw[4:], "big")
+        )
+
+    def write(self, value, w):
+        w.write(
+            bytes(int(p) for p in value.host.split("."))
+            + value.port.to_bytes(2, "big")
+        )
+
+
+@pytest.fixture
+def address_codec():
+    codec = rombob.register_codec(SystemAddress, SystemAddressCodec())
+    yield codec
+    rombob.unregister_codec(SystemAddress)
+
+
+class TestRegisterCodec:
+    def test_unknown_type_without_codec(self):
+        with pytest.raises(BytesOperationError):
+            get_codec(SystemAddress)
+
+    def test_get_codec(self, address_codec):
+        assert get_codec(SystemAddress) is address_codec
+
+    def test_class_fields(self, address_codec):
+        @dataclasses.dataclass
+        class Packet:
+            id: U8_B
+            addr: SystemAddress
+            others: t.Annotated[list[SystemAddress], Len(2)]
+
+        a, b = SystemAddress("1.2.3.4", 80), SystemAddress("5.6.7.8", 443)
+        value = Packet(id=1, addr=a, others=[a, b])
+        for compile in (True, False):
+            codec = get_codec(Packet, compile=compile)
+            data = codec.encode(value)
+            assert data == b"\x01" + bytes([1, 2, 3, 4, 0, 80]) + bytes(
+                [1, 2, 3, 4, 0, 80, 5, 6, 7, 8, 1, 187]
+            )
+            assert codec.decode(data) == value
+
+    def test_registered_before_cached_class_codec(self):
+        @dataclasses.dataclass
+        class Holder:
+            addr: SystemAddress
+
+        with pytest.raises(BytesOperationError):
+            get_codec(Holder)
+        rombob.register_codec(SystemAddress, SystemAddressCodec())
+        try:
+            decoded = get_codec(Holder).decode(b"\x01\x02\x03\x04\x00P")
+            assert decoded.addr == SystemAddress("1.2.3.4", 80)
+        finally:
+            rombob.unregister_codec(SystemAddress)
+        with pytest.raises(BytesOperationError):
+            get_codec(Holder)
+
+    def test_explicit_annotation_wins(self, address_codec):
+        other = SystemAddressCodec()
+        hint = t.Annotated[SystemAddress, other]
+        assert get_codec(hint) is other
+
+    def test_priority_over_dataclass_and_enum(self):
+        @dataclasses.dataclass
+        class Point:
+            x: U8_B
+
+        codec = RawCodec()
+        rombob.register_codec(Point, codec)
+        rombob.register_codec(EnumIntegers, codec)
+        try:
+            assert get_codec(Point) is codec
+            assert get_codec(EnumIntegers) is codec
+        finally:
+            rombob.unregister_codec(Point)
+            rombob.unregister_codec(EnumIntegers)
+        assert isinstance(get_codec(Point), rombob.ClassCodec)
+
+    def test_generic_falls_back_to_origin(self):
+        T = t.TypeVar("T")
+
+        class Box(t.Generic[T]):
+            pass
+
+        codec = RawCodec()
+        rombob.register_codec(Box, codec)
+        try:
+            assert get_codec(Box[int]) is codec
+        finally:
+            rombob.unregister_codec(Box)
+
+    def test_duplicates_and_override(self, address_codec):
+        with pytest.raises(BytesOperationError, match=r"already has"):
+            rombob.register_codec(SystemAddress, SystemAddressCodec())
+        with pytest.raises(BytesOperationError, match=r"already has"):
+            rombob.register_codec(int, StructCodec(">i"))
+
+        new = SystemAddressCodec()
+        rombob.register_codec(SystemAddress, new, override=True)
+        assert get_codec(SystemAddress) is new
+
+    def test_override_builtin_and_restore(self):
+        codec = StructCodec(">i")
+        rombob.register_codec(int, codec, override=True)
+        try:
+            assert get_codec(int) is codec
+        finally:
+            rombob.unregister_codec(int)
+        assert get_codec(int) == StructCodec(">q")
+
+    def test_unregister_unknown_is_noop(self):
+        rombob.unregister_codec(SystemAddress)
+
+    def test_len_is_rejected(self, address_codec):
+        with pytest.raises(BytesOperationError, match=r"Len and Prefix"):
+            get_codec(t.Annotated[SystemAddress, Len(2)])
+
+    def test_validation(self):
+        codec = RawCodec()
+        with pytest.raises(BytesOperationError, match=r"expects a Codec"):
+            rombob.register_codec(SystemAddress, SystemAddress)  # type: ignore
+        for bad in (
+            t.Annotated[int, codec],
+            t.Literal[1],
+            t.Literal,
+            None,
+            "SystemAddress",
+            t.TypeVar("X"),
+            t.Annotated[int, {"a": 1}],
+        ):
+            with pytest.raises(BytesOperationError):
+                rombob.register_codec(bad, codec)
+
+
+class TestRegisterCodecConsistency:
+    def test_override_of_a_primitive_reaches_every_path(self):
+        class Wide(enum.IntEnum):
+            A = 1
+
+        codec = StructCodec(">i")
+        rombob.register_codec(int, codec, override=True)
+        try:
+            assert get_codec(int) is codec
+            assert get_codec(t.Literal[1]).codec is codec
+            # the value type of an IntEnum is looked up the same way
+            assert get_codec(Wide).codec is codec
+            assert get_codec(Wide, compile=False).codec is codec
+        finally:
+            rombob.unregister_codec(int)
+        assert get_codec(Wide).codec == StructCodec(">q")
+
+    def test_falsy_codec_is_still_used(self):
+        class Box:
+            pass
+
+        class FalsyCodec(Codec):
+            def __len__(self):
+                return 0
+
+            def read(self, r):
+                return Box()
+
+            def write(self, value, w):
+                pass
+
+        codec = FalsyCodec()
+        rombob.register_codec(Box, codec)
+        try:
+            assert get_codec(Box) is codec
+            assert get_codec(t.Annotated[Box, rombob.Named]) is codec
+        finally:
+            rombob.unregister_codec(Box)
