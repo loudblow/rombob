@@ -1670,8 +1670,26 @@ def _resolve_dataclass(
         actual_hint,
         args,
         context,
-        lambda _: {f.name: f.type for f in dataclasses.fields(actual_hint)},
+        lambda _: _dataclass_hints(actual_hint),
     )
+
+
+def _dataclass_hints(cls: t.Any) -> dict[str, t.Any]:
+    """
+    Field hints of a dataclass with forward references resolved
+    (`from __future__ import annotations`, string annotations).
+    """
+    fields = dataclasses.fields(cls)
+    try:
+        hints = t.get_type_hints(cls, include_extras=True)
+    except NameError as e:
+        # e.g. a class defined inside a function referencing a local name
+        if any(isinstance(f.type, str) for f in fields):
+            raise BytesOperationError(
+                f"Cannot resolve forward references of {cls}: {e}"
+            ) from e
+        return {f.name: f.type for f in fields}
+    return {f.name: hints.get(f.name, f.type) for f in fields}
 
 
 def _resolve_collection(
@@ -1700,6 +1718,11 @@ def _get_codec_inner(
 ) -> Codec:
     if isinstance(hint, t.TypeVar):
         hint = context.get(hint, hint)
+
+    if isinstance(hint, (str, t.ForwardRef)):
+        # Class fields are resolved via get_type_hints before reaching here,
+        # so this is a bare string hint with no namespace to resolve it in.
+        raise BytesOperationError(f"Unresolved forward reference {hint!r}")
 
     origin = t.get_origin(hint)
     args = t.get_args(hint)
