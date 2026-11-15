@@ -1,0 +1,2 @@
+class BytesOperationError(Exception):
+    pass

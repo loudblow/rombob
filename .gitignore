@@ -98,3 +98,5 @@ cython_debug/
 **/.conda/
 
 .DS_Store
+
+.agents_cache/
